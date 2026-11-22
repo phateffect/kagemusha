@@ -75,14 +75,14 @@ async def validate_resolved_addresses(repository: str) -> None:
             raise invalid_request("Repository address is not allowed")
 
 
-def _git_arguments(settings: Settings, *, local: bool = False) -> tuple[str, ...]:
+def _git_arguments(
+    settings: Settings, *, local: bool = False, allow_hooks: bool = False
+) -> tuple[str, ...]:
     arguments = [
         "git",
         "--no-pager",
         "-c",
         "credential.helper=",
-        "-c",
-        "core.hooksPath=/dev/null",
         "-c",
         "gc.auto=0",
         "-c",
@@ -98,6 +98,8 @@ def _git_arguments(settings: Settings, *, local: bool = False) -> tuple[str, ...
         "-c",
         f"protocol.{'https' if local else 'file'}.allow=never",
     ]
+    if not allow_hooks:
+        arguments[4:4] = ("-c", "core.hooksPath=/dev/null")
     if settings.ca_bundle is not None:
         arguments.extend(("-c", f"http.sslCAInfo={settings.ca_bundle}"))
     return tuple(arguments)
@@ -133,10 +135,10 @@ def _git_environment(
             env.update(
                 {
                     "GIT_ASKPASS": str(settings.askpass_path),
-                    "GWS_GIT_USERNAME": "x-access-token"
+                    "KAGEMUSHA_GIT_USERNAME": "x-access-token"
                     if provider == "github"
                     else "oauth2",
-                    "GWS_GIT_TOKEN": token,
+                    "KAGEMUSHA_GIT_TOKEN": token,
                 }
             )
         yield env
@@ -192,13 +194,17 @@ async def run_git(
     provider: str | None = None,
     token: str | None = None,
     local: bool = False,
+    allow_hooks: bool = False,
     missing_ref: bool = False,
 ) -> str:
-    remote = not local and token is not None
+    remote = not local
     with _git_environment(settings, provider=provider, token=token, local=local) as env:
         try:
             return await runner.run(
-                (*_git_arguments(settings, local=local), *arguments),
+                (
+                    *_git_arguments(settings, local=local, allow_hooks=allow_hooks),
+                    *arguments,
+                ),
                 env=env,
                 secrets=(token,) if token else (),
                 operation=operation,

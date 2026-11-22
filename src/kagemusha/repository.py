@@ -153,7 +153,7 @@ class RepositoryManager:
         validate_repository_url(project.repository, self.settings)
         await validate_resolved_addresses(project.repository)
         bare = self.bare_path(project.id)
-        snapshot = f"refs/gws/snapshots/{uuid.uuid4().hex}"
+        snapshot = f"refs/kagemusha/snapshots/{uuid.uuid4().hex}"
         started = time.monotonic()
         async with file_lock(self.lock_path(project.id)):
             try:
@@ -204,7 +204,7 @@ class RepositoryManager:
                 raise
 
     async def delete_snapshot(self, project_id: str, snapshot: str) -> None:
-        if not snapshot.startswith("refs/gws/snapshots/"):
+        if not snapshot.startswith("refs/kagemusha/snapshots/"):
             return
         async with file_lock(self.lock_path(project_id)):
             await self._delete_snapshot_unlocked(self.bare_path(project_id), snapshot)
@@ -288,7 +288,7 @@ class RepositoryManager:
                 pass
 
     async def _cleanup_snapshots(self, bare: Path, now: float) -> None:
-        root = bare / "refs" / "gws" / "snapshots"
+        root = bare / "refs" / "kagemusha" / "snapshots"
         if not root.is_dir():
             return
         for ref in root.iterdir():
@@ -306,7 +306,7 @@ class RepositoryManager:
                     f"--git-dir={bare}",
                     "update-ref",
                     "-d",
-                    f"refs/gws/snapshots/{ref.name}",
+                    f"refs/kagemusha/snapshots/{ref.name}",
                 ),
                 operation="clean stale snapshot",
                 local=True,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 import ssl
 import subprocess
 import threading
@@ -36,6 +38,9 @@ class GitRemote:
     @property
     def url(self) -> str:
         return f"https://127.0.0.1:{self.port}/remote.git"
+
+    def url_for(self, repository: str) -> str:
+        return f"https://127.0.0.1:{self.port}/{repository}"
 
     @property
     def container_url(self) -> str:
@@ -86,7 +91,13 @@ class GitHttpsServer:
                 if outer.delay_seconds:
                     time.sleep(outer.delay_seconds)
                 parsed = urlsplit(self.path)
-                if not parsed.path.startswith("/remote.git/"):
+                if parsed.path.endswith("/info/lfs/objects/batch"):
+                    self.handle_lfs_batch(parsed.path)
+                    return
+                if "/info/lfs/objects/" in parsed.path and self.command == "GET":
+                    self.handle_lfs_object(parsed.path)
+                    return
+                if not re.match(r"^/[A-Za-z0-9_.-]+\.git/", parsed.path):
                     self.send_error(404)
                     return
                 length = int(self.headers.get("Content-Length", "0"))
@@ -141,6 +152,67 @@ class GitHttpsServer:
                         self.wfile.write(response_body)
                     except BrokenPipeError:
                         pass
+
+            def handle_lfs_batch(self, path: str) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                repository_name = path.split("/", 2)[1]
+                objects = []
+                for requested in request.get("objects", []):
+                    oid = requested["oid"]
+                    object_path = (
+                        bare.parent / repository_name / "lfs" / "objects" / oid
+                    )
+                    if (
+                        not re.fullmatch(r"[0-9a-f]{64}", oid)
+                        or not object_path.is_file()
+                    ):
+                        objects.append(
+                            {
+                                "oid": oid,
+                                "size": requested["size"],
+                                "error": {
+                                    "code": 404,
+                                    "message": "LFS object not found",
+                                },
+                            }
+                        )
+                        continue
+                    host = self.headers["Host"]
+                    objects.append(
+                        {
+                            "oid": oid,
+                            "size": object_path.stat().st_size,
+                            "actions": {
+                                "download": {
+                                    "href": f"https://{host}/{repository_name}/info/lfs/objects/{oid}"
+                                }
+                            },
+                        }
+                    )
+                response = json.dumps(
+                    {"transfer": "basic", "objects": objects}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.git-lfs+json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def handle_lfs_object(self, path: str) -> None:
+                parts = path.split("/")
+                repository_name = parts[1]
+                oid = parts[-1]
+                object_path = bare.parent / repository_name / "lfs" / "objects" / oid
+                if not re.fullmatch(r"[0-9a-f]{64}", oid) or not object_path.is_file():
+                    self.send_error(404)
+                    return
+                content = object_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
 
             def authorized(self) -> bool:
                 authorization = self.headers.get("Authorization", "")

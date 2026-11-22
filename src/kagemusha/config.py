@@ -17,7 +17,7 @@ def _hosts(value: Any) -> frozenset[str]:
     else:
         entries = frozenset(str(entry).strip().lower() for entry in value)
     if not entries or "" in entries:
-        raise ValueError("GWS_ALLOWED_GIT_HOSTS must contain explicit hosts")
+        raise ValueError("KAGEMUSHA_ALLOWED_GIT_HOSTS must contain explicit hosts")
     for entry in entries:
         if not _HOST.fullmatch(entry) or entry.endswith("."):
             raise ValueError(f"Invalid Git host allowlist entry: {entry}")
@@ -39,7 +39,7 @@ def _hosts(value: Any) -> frozenset[str]:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="GWS_",
+        env_prefix="KAGEMUSHA_",
         env_ignore_empty=True,
         extra="forbid",
         frozen=True,
@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     max_request_body_bytes: int = Field(default=64 * 1024, ge=1)
     temp_ttl_seconds: int = Field(default=3600, ge=1)
     temp_budget_bytes: int = Field(default=2 * 1024**3, ge=1)
+    max_submodules: int = Field(default=100, ge=0, le=1000)
+    max_submodule_depth: int = Field(default=10, ge=0, le=100)
     ca_bundle: FilePath | None = None
 
     @model_validator(mode="after")
@@ -71,7 +73,9 @@ class Settings(BaseSettings):
                 with self.ca_bundle.open("rb") as stream:
                     stream.read(1)
             except OSError as error:
-                raise ValueError("GWS_CA_BUNDLE must name a readable file") from error
+                raise ValueError(
+                    "KAGEMUSHA_CA_BUNDLE must name a readable file"
+                ) from error
         return self
 
     @property

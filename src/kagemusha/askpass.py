@@ -6,7 +6,9 @@ import sys
 def main() -> int:
     prompt = sys.argv[1] if len(sys.argv) > 1 else ""
     key = (
-        "GWS_GIT_USERNAME" if prompt.lower().startswith("username") else "GWS_GIT_TOKEN"
+        "KAGEMUSHA_GIT_USERNAME"
+        if prompt.lower().startswith("username")
+        else "KAGEMUSHA_GIT_TOKEN"
     )
     value = os.environ.get(key)
     if value is None:

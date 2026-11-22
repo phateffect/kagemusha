@@ -84,6 +84,7 @@ def wait_healthy(port: int, project: str, env: dict[str, str]) -> None:
 def verify_archive(archive: bytes, destination: Path, expected_commit: str) -> None:
     workspace = extract_workspace(archive, destination)
     assert git("rev-parse", "HEAD", cwd=workspace) == expected_commit
+    assert git("branch", "--show-current", cwd=workspace) == "kagemusha/mr-456"
     assert git("status", "--porcelain", cwd=workspace) == ""
     assert int(git("rev-list", "--count", "HEAD", cwd=workspace)) == 10
     assert git("rev-parse", "--is-shallow-repository", cwd=workspace) == "true"
@@ -117,8 +118,8 @@ def main() -> None:
     port = free_port()
     env.update(
         {
-            "GWS_API_TOKEN": SERVICE_TOKEN,
-            "GWS_CA_BUNDLE": "/run/kagemusha-test-ca.pem",
+            "KAGEMUSHA_API_TOKEN": SERVICE_TOKEN,
+            "KAGEMUSHA_CA_BUNDLE": "/run/kagemusha-test-ca.pem",
             "KAGEMUSHA_HTTP_PORT": str(port),
         }
     )
@@ -141,7 +142,9 @@ def main() -> None:
                     "    volumes:\n"
                     f"      - {ca_bundle}:/run/kagemusha-test-ca.pem:ro\n"
                 )
-                env["GWS_ALLOWED_GIT_HOSTS"] = f"host.containers.internal:{remote_port}"
+                env["KAGEMUSHA_ALLOWED_GIT_HOSTS"] = (
+                    f"host.containers.internal:{remote_port}"
+                )
                 compose = [
                     "podman",
                     "compose",
@@ -186,7 +189,14 @@ def main() -> None:
                         env=env,
                     )
                     command(
-                        ["podman", "exec", name, "sh", "-c", "command -v git tar zstd"],
+                        [
+                            "podman",
+                            "exec",
+                            name,
+                            "sh",
+                            "-c",
+                            "command -v git git-lfs tar zstd",
+                        ],
                         env=env,
                     )
                     command(
@@ -240,6 +250,7 @@ def main() -> None:
                             "refs/merge-requests/456/head^{commit}",
                         )
                         assert copy.headers["x-git-commit"] == expected
+                        assert copy.headers["x-git-branch"] == "kagemusha/mr-456"
                         verify_archive(copy.content, work / "extracted", expected)
 
                     command([*compose, "down"], env=env)

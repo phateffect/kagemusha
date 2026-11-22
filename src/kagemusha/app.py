@@ -18,7 +18,7 @@ from .errors import ErrorCode, ServiceError
 from .log import log_request
 from .models import CopyRequest, ProjectRequest, ProjectResponse
 from .process import ProcessRunner
-from .refs import resolve_ref
+from .refs import resolve_ref, workspace_branch
 from .repository import RepositoryManager
 from .workspace import WorkspaceManager, cleanup_workspace
 
@@ -165,10 +165,18 @@ def create_app(settings: Settings) -> FastAPI:
         )
         project = await repositories.get(project_id)
         ref = resolve_ref(payload.ref, project.provider)
+        branch, tracks_remote = workspace_branch(
+            payload.ref, ref, payload.branch_prefix
+        )
         depth = settings.default_depth if payload.depth is None else payload.depth
         fields.update({"provider": project.provider, "depth": depth})
         result = await workspaces.create(
-            project, ref, payload.credential.token.get_secret_value(), depth
+            project,
+            ref,
+            branch,
+            tracks_remote,
+            payload.credential.token.get_secret_value(),
+            depth,
         )
         fields.update(
             {
@@ -179,16 +187,19 @@ def create_app(settings: Settings) -> FastAPI:
                 "archive_size_bytes": result.archive_size_bytes,
             }
         )
+        headers = {
+            "Content-Length": str(result.archive_size_bytes),
+            "X-Git-Commit": result.commit,
+            "X-Git-Ref": payload.ref,
+            "X-Git-Depth": str(depth),
+        }
+        if result.branch is not None:
+            headers["X-Git-Branch"] = result.branch
         return ArchiveResponse(
             result.archive,
             media_type="application/zstd",
             filename="workspace.tar.zst",
-            headers={
-                "Content-Length": str(result.archive_size_bytes),
-                "X-Git-Commit": result.commit,
-                "X-Git-Ref": payload.ref,
-                "X-Git-Depth": str(depth),
-            },
+            headers=headers,
             cleanup_root=result.root,
         )
 

@@ -43,7 +43,9 @@ def test_concurrent_copies_share_cache_but_not_snapshots(client, remote, auth):
     assert len({response.headers["x-git-commit"] for response in responses}) == 1
     assert {"second-token", "third-token"}.issubset(set(remote.used_tokens))
     cache = client.app.state.settings.projects_dir / "project-a.git"
-    assert git("--git-dir", str(cache), "for-each-ref", "refs/gws/snapshots") == ""
+    assert (
+        git("--git-dir", str(cache), "for-each-ref", "refs/kagemusha/snapshots") == ""
+    )
     assert not list(client.app.state.settings.tmp_dir.glob("copy-*"))
 
 
@@ -147,7 +149,14 @@ async def test_cancel_remote_fetch_cleans_workspace_and_snapshot(
 
     monkeypatch.setattr(repository_module, "run_git", slow_fetch)
     task = asyncio.create_task(
-        workspaces.create(project, resolve_ref("main", "gitlab"), "test-git-token", 10)
+        workspaces.create(
+            project,
+            resolve_ref("main", "gitlab"),
+            "main",
+            True,
+            "test-git-token",
+            10,
+        )
     )
     await asyncio.wait_for(started.wait(), timeout=2)
     task.cancel()
@@ -159,7 +168,7 @@ async def test_cancel_remote_fetch_cleans_workspace_and_snapshot(
             "--git-dir",
             str(repositories.bare_path(project.id)),
             "for-each-ref",
-            "refs/gws/snapshots",
+            "refs/kagemusha/snapshots",
         )
         == ""
     )
@@ -184,7 +193,14 @@ async def test_cancel_archive_cleans_workspace_and_snapshot(
 
     monkeypatch.setattr(workspace_module, "create_archive", slow_archive)
     task = asyncio.create_task(
-        workspaces.create(project, resolve_ref("main", "gitlab"), "test-git-token", 10)
+        workspaces.create(
+            project,
+            resolve_ref("main", "gitlab"),
+            "main",
+            True,
+            "test-git-token",
+            10,
+        )
     )
     await asyncio.wait_for(started.wait(), timeout=10)
     task.cancel()
@@ -196,7 +212,7 @@ async def test_cancel_archive_cleans_workspace_and_snapshot(
             "--git-dir",
             str(repositories.bare_path(project.id)),
             "for-each-ref",
-            "refs/gws/snapshots",
+            "refs/kagemusha/snapshots",
         )
         == ""
     )
@@ -222,7 +238,9 @@ def test_archive_failure_cleans_resources(
     settings = client.app.state.settings
     assert not list(settings.tmp_dir.glob("copy-*"))
     cache = settings.projects_dir / "project-a.git"
-    assert git("--git-dir", str(cache), "for-each-ref", "refs/gws/snapshots") == ""
+    assert (
+        git("--git-dir", str(cache), "for-each-ref", "refs/kagemusha/snapshots") == ""
+    )
 
 
 def test_download_disconnect_runs_cleanup(client, remote, auth, credential):

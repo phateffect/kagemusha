@@ -320,6 +320,7 @@ Request:
 {
   "ref": "mr:123",
   "depth": 50,
+  "branch_prefix": "agent/task-123",
   "credential": {
     "type": "token",
     "token": "glpat-xxxxx"
@@ -333,6 +334,7 @@ Request:
 |---|---|---|---|
 | ref | 是 | — | Branch、Tag、PR/MR |
 | depth | 否 | 50 | Git 历史深度 |
+| branch_prefix | 否 | — | 可选的本地工作分支前缀 |
 | credential.type | 是 | — | token |
 | credential.token | 是 | — | 本次 Fetch 的 Token |
 
@@ -368,11 +370,13 @@ Request:
 8. 释放 Fetch Lock。
 9. 创建临时 Git Workspace。
 10. 按指定 Depth 从缓存仓库 Fetch。
-11. Checkout 固定 Commit。
-12. 验证 Git 状态与对象独立性。
-13. 生成 tar.zst 归档。
-14. 返回归档。
-15. 删除内部临时 Ref 和临时 Workspace。
+11. Checkout 固定 Commit，并按 Ref 类型或 `branch_prefix` 配置工作分支。
+12. 递归校验并初始化 HTTPS Submodule。
+13. 下载并校验主仓库及所有 Submodule 的 Git LFS 对象。
+14. 验证 Git 状态与对象独立性。
+15. 生成 tar.zst 归档。
+16. 返回归档。
+17. 删除内部临时 Ref 和临时 Workspace。
 
 内部临时 Ref 的创建与删除必须协调，防止并发 GC 回收正在使用的对象。
 
@@ -387,6 +391,7 @@ Content-Length: <archive-bytes>
 X-Git-Commit: <sha>
 X-Git-Ref: mr:123
 X-Git-Depth: 50
+X-Git-Branch: kagemusha/mr-123
 ```
 
 响应主体为二进制归档。
@@ -417,9 +422,9 @@ git switch -c agent/task-123
 git commit
 ```
 
-允许 Detached HEAD。
+普通 Branch 默认检出同名 tracking branch；PR/MR 默认检出 `kagemusha/pr-*` 或 `kagemusha/mr-*`；Tag 默认允许 Detached HEAD。传入 `branch_prefix` 时，所有 Ref 都创建带该前缀且无虚假 upstream 的本地工作分支。
 
-不自动生成 Agent 分支。
+Submodule 必须递归完成，Git LFS pointer 必须在返回前 hydration。任何必要对象下载失败时请求整体失败。
 
 ---
 
@@ -527,7 +532,7 @@ git --git-dir=/data/projects/project-a.git \
 可以采用请求唯一的内部 Ref：
 
 ```text
-refs/gws/snapshots/<request-uuid>
+refs/kagemusha/snapshots/<request-uuid>
 ```
 
 每次请求的固定 Commit 生命周期需要覆盖整个 Workspace 生成过程。
@@ -604,7 +609,7 @@ Commit = abcdef123456...
 服务在 Bare Repo 中为这次请求创建：
 
 ```text
-refs/gws/snapshots/<uuid>
+refs/kagemusha/snapshots/<uuid>
 ```
 
 该 Ref 指向本次 Fetch 的 Commit。
@@ -630,14 +635,14 @@ git init /data/tmp/workspace-<uuid>
 git -C /data/tmp/workspace-<uuid> \
   fetch --no-tags --depth=50 \
   file:///data/projects/project-a.git \
-  refs/gws/snapshots/<uuid>
+  refs/kagemusha/snapshots/<uuid>
 ```
 
-然后：
+然后根据 Ref 类型和 `branch_prefix` 检出固定 Commit。例如普通 Branch：
 
 ```bash
 git -C /data/tmp/workspace-<uuid> \
-  checkout --detach FETCH_HEAD
+  checkout -B main <commit>
 ```
 
 实际实现中应固定并核对完整 Commit SHA，不能在多个 Git 命令之间依赖未经保护的共享状态。
@@ -648,7 +653,7 @@ git -C /data/tmp/workspace-<uuid> \
 git -C /data/tmp/workspace-<uuid> \
   fetch --no-tags \
   file:///data/projects/project-a.git \
-  refs/gws/snapshots/<uuid>
+  refs/kagemusha/snapshots/<uuid>
 ```
 
 然后 Checkout。
@@ -935,13 +940,13 @@ Git Token 与 Git Workspace Service API Token 是两个不同的概念。
 服务间认证：
 
 ```http
-Authorization: Bearer <GWS_API_TOKEN>
+Authorization: Bearer <KAGEMUSHA_API_TOKEN>
 ```
 
 使用环境变量：
 
 ```text
-GWS_API_TOKEN
+KAGEMUSHA_API_TOKEN
 ```
 
 所有业务 API 必须验证该 Token。
@@ -979,7 +984,7 @@ GWS_API_TOKEN
 默认：
 
 ```text
-GWS_MAX_CONCURRENT_GIT=4
+KAGEMUSHA_MAX_CONCURRENT_GIT=4
 ```
 
 限制重量级 Git/Archive 操作的并发数量。
@@ -1074,27 +1079,29 @@ replicas=1
 通过环境变量配置。
 
 ```text
-GWS_DATA_DIR=/data
-GWS_API_TOKEN=<service-secret>
+KAGEMUSHA_DATA_DIR=/data
+KAGEMUSHA_API_TOKEN=<service-secret>
 
-GWS_MAX_CONCURRENT_GIT=4
-GWS_GIT_TIMEOUT_SECONDS=300
+KAGEMUSHA_MAX_CONCURRENT_GIT=4
+KAGEMUSHA_GIT_TIMEOUT_SECONDS=300
 
-GWS_DEFAULT_DEPTH=50
-GWS_MAX_DEPTH=1000
+KAGEMUSHA_DEFAULT_DEPTH=50
+KAGEMUSHA_MAX_DEPTH=1000
 
-GWS_ZSTD_LEVEL=3
-GWS_ZSTD_THREADS=1
+KAGEMUSHA_ZSTD_LEVEL=3
+KAGEMUSHA_ZSTD_THREADS=1
 
-GWS_MAX_ARCHIVE_BYTES=1073741824
-GWS_TEMP_TTL_SECONDS=3600
+KAGEMUSHA_MAX_ARCHIVE_BYTES=1073741824
+KAGEMUSHA_TEMP_TTL_SECONDS=3600
+KAGEMUSHA_MAX_SUBMODULES=100
+KAGEMUSHA_MAX_SUBMODULE_DEPTH=10
 
-GWS_ALLOWED_GIT_HOSTS=github.com,gitlab.com
+KAGEMUSHA_ALLOWED_GIT_HOSTS=github.com,gitlab.com
 ```
 
 Host Allowlist 可以增加企业 GitLab 域名。
 
-不允许将 `GWS_ALLOWED_GIT_HOSTS` 配置为空并解释为允许所有 Host。
+不允许将 `KAGEMUSHA_ALLOWED_GIT_HOSTS` 配置为空并解释为允许所有 Host。
 
 配置启动时严格验证，错误时应 Fail Fast。
 
@@ -1148,6 +1155,7 @@ FROM python:3.13-slim-trixie
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        git \
+       git-lfs \
        tar \
        zstd \
        ca-certificates \
@@ -1162,7 +1170,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    GWS_DATA_DIR=/data
+    KAGEMUSHA_DATA_DIR=/data
 
 RUN groupadd --system app \
     && useradd --system --gid app app \
@@ -1239,22 +1247,24 @@ services:
       - "127.0.0.1:8000:8000"
 
     environment:
-      GWS_DATA_DIR: /data
-      GWS_API_TOKEN: ${GWS_API_TOKEN:?required}
+      KAGEMUSHA_DATA_DIR: /data
+      KAGEMUSHA_API_TOKEN: ${KAGEMUSHA_API_TOKEN:?required}
 
-      GWS_MAX_CONCURRENT_GIT: "4"
-      GWS_GIT_TIMEOUT_SECONDS: "300"
+      KAGEMUSHA_MAX_CONCURRENT_GIT: "4"
+      KAGEMUSHA_GIT_TIMEOUT_SECONDS: "300"
 
-      GWS_DEFAULT_DEPTH: "50"
-      GWS_MAX_DEPTH: "1000"
+      KAGEMUSHA_DEFAULT_DEPTH: "50"
+      KAGEMUSHA_MAX_DEPTH: "1000"
 
-      GWS_ZSTD_LEVEL: "3"
-      GWS_ZSTD_THREADS: "1"
+      KAGEMUSHA_ZSTD_LEVEL: "3"
+      KAGEMUSHA_ZSTD_THREADS: "1"
 
-      GWS_MAX_ARCHIVE_BYTES: "1073741824"
-      GWS_TEMP_TTL_SECONDS: "3600"
+      KAGEMUSHA_MAX_ARCHIVE_BYTES: "1073741824"
+      KAGEMUSHA_TEMP_TTL_SECONDS: "3600"
+      KAGEMUSHA_MAX_SUBMODULES: "100"
+      KAGEMUSHA_MAX_SUBMODULE_DEPTH: "10"
 
-      GWS_ALLOWED_GIT_HOSTS: ${GWS_ALLOWED_GIT_HOSTS:-github.com,gitlab.com}
+      KAGEMUSHA_ALLOWED_GIT_HOSTS: ${KAGEMUSHA_ALLOWED_GIT_HOSTS:-github.com,gitlab.com}
 
     volumes:
       - git-workspace-data:/data
@@ -1374,7 +1384,9 @@ error_code
 - depth=0 包含完整目标 Commit 历史。
 - 完整历史少于 depth 时能正常处理。
 - 使用 PR/MR Ref 时可以生成 Shallow Workspace。
-- Detached HEAD 状态正确。
+- Branch、PR/MR、Tag 及自定义 Branch Prefix 的 HEAD 状态正确。
+- HTTPS Submodule 递归初始化且固定在 gitlink Commit。
+- 需要认证的 Git LFS 对象在归档前完整下载。
 
 ## 18.3 Workspace 独立性
 
@@ -1513,7 +1525,7 @@ docker compose up -d --build
 ```bash
 curl -X POST \
   http://127.0.0.1:8000/projects/my-project \
-  -H "Authorization: Bearer $GWS_API_TOKEN" \
+  -H "Authorization: Bearer $KAGEMUSHA_API_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary @init-project.json
 ```
@@ -1523,7 +1535,7 @@ curl -X POST \
 ```bash
 curl -X POST \
   http://127.0.0.1:8000/projects/my-project/copies \
-  -H "Authorization: Bearer $GWS_API_TOKEN" \
+  -H "Authorization: Bearer $KAGEMUSHA_API_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary @create-copy.json \
   -o workspace.tar.zst
@@ -1545,8 +1557,6 @@ JSON 文件只作为 curl 输入示例，不应长期持久化真实 Token；建
 - Git Provider API Client
 - gh/glab 集成
 - E2B SDK
-- Git Submodule 自动初始化
-- Git LFS 自动下载
 - 跨节点 Git 缓存
 - 多实例服务
 - 分布式锁
@@ -1554,7 +1564,6 @@ JSON 文件只作为 curl 输入示例，不应长期持久化真实 Token；建
 - 对象存储
 - 持久化 Task 状态
 - Workspace 长期存储
-- 自动生成 Agent 工作分支
 - 多 Ref 工作区（如同时提供 main 和 MR 分支）
 
 这些能力将来可以独立增加。

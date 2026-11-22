@@ -34,7 +34,7 @@ def test_ref_mapping(value, provider, remote):
         "pr:0",
         "pr:abc",
         "refs/remotes/origin/main",
-        "refs/gws/snapshots/abc",
+        "refs/kagemusha/snapshots/abc",
         "/main",
         "main/",
         "main..next",
@@ -59,18 +59,26 @@ def test_special_ref_provider_mismatch(value, provider):
 
 
 @pytest.mark.parametrize(
-    ("ref", "provider", "expected_file"),
+    ("ref", "provider", "expected_file", "expected_branch"),
     [
-        ("main", "gitlab", "history.txt"),
-        ("feature/login", "github", "history.txt"),
-        ("refs/tags/v1.0.0", "gitlab", "history.txt"),
-        ("refs/tags/annotated-v1.0.0", "github", "history.txt"),
-        ("pr:123", "github", "pr.txt"),
-        ("mr:456", "gitlab", "mr.txt"),
+        ("main", "gitlab", "history.txt", "main"),
+        ("feature/login", "github", "history.txt", "feature/login"),
+        ("refs/tags/v1.0.0", "gitlab", "history.txt", "HEAD"),
+        ("refs/tags/annotated-v1.0.0", "github", "history.txt", "HEAD"),
+        ("pr:123", "github", "pr.txt", "kagemusha/pr-123"),
+        ("mr:456", "gitlab", "mr.txt", "kagemusha/mr-456"),
     ],
 )
 def test_fetch_supported_refs(
-    client, remote, auth, credential, tmp_path, ref, provider, expected_file
+    client,
+    remote,
+    auth,
+    credential,
+    tmp_path,
+    ref,
+    provider,
+    expected_file,
+    expected_branch,
 ):
     assert initialize(client, remote, auth, provider=provider).status_code == 201
     response = client.post(
@@ -92,7 +100,61 @@ def test_fetch_supported_refs(
     workspace = extract_workspace(response.content, tmp_path / "extracted")
     assert (workspace / expected_file).is_file()
     assert git("rev-parse", "HEAD", cwd=workspace) == expected_commit
-    assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=workspace) == "HEAD"
+    assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=workspace) == expected_branch
+    if expected_branch == "HEAD":
+        assert "x-git-branch" not in response.headers
+    else:
+        assert response.headers["x-git-branch"] == expected_branch
+    if ref in {"main", "feature/login"}:
+        assert (
+            git(
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+                cwd=workspace,
+            )
+            == f"origin/{expected_branch}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("ref", "provider", "expected"),
+    [
+        ("main", "gitlab", "agent/session/main"),
+        ("mr:456", "gitlab", "agent/session/mr-456"),
+        ("refs/tags/v1.0.0", "gitlab", "agent/session/tag-v1.0.0"),
+    ],
+)
+def test_branch_prefix(
+    client, remote, auth, credential, tmp_path, ref, provider, expected
+):
+    assert initialize(client, remote, auth, provider=provider).status_code == 201
+    response = client.post(
+        "/projects/project-a/copies",
+        headers=auth,
+        json={"ref": ref, "branch_prefix": "agent/session", **credential},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-git-branch"] == expected
+    workspace = extract_workspace(response.content, tmp_path / "prefixed")
+    assert git("branch", "--show-current", cwd=workspace) == expected
+    config = git("config", "--local", "--list", cwd=workspace)
+    assert f"branch.{expected}.remote=" not in config
+
+
+@pytest.mark.parametrize(
+    "prefix", ["bad..prefix", ".hidden", "bad@{upstream}", "bad/", "-bad"]
+)
+def test_invalid_branch_prefix(client, remote, auth, credential, prefix):
+    assert initialize(client, remote, auth).status_code == 201
+    response = client.post(
+        "/projects/project-a/copies",
+        headers=auth,
+        json={"ref": "main", "branch_prefix": prefix, **credential},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_branch_update_is_fetched_and_deleted_branch_does_not_use_cache(

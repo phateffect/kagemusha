@@ -26,7 +26,7 @@ def test_tokens_and_authorization_do_not_enter_logs(
     assert "test-git-token" not in caplog.text
     assert "service-test-token" not in caplog.text
     assert "Authorization" not in caplog.text
-    assert "GWS_GIT_TOKEN" not in caplog.text
+    assert "KAGEMUSHA_GIT_TOKEN" not in caplog.text
 
 
 def test_validation_error_does_not_echo_token(client, remote, auth):
@@ -62,7 +62,7 @@ def test_empty_host_allowlist_fails(tmp_path):
 
 
 def test_data_directory_is_required(monkeypatch):
-    monkeypatch.delenv("GWS_DATA_DIR", raising=False)
+    monkeypatch.delenv("KAGEMUSHA_DATA_DIR", raising=False)
     with pytest.raises(ValueError):
         Settings(
             api_token="long-service-secret",
@@ -71,11 +71,11 @@ def test_data_directory_is_required(monkeypatch):
 
 
 def test_settings_load_comma_separated_environment(monkeypatch, tmp_path):
-    monkeypatch.setenv("GWS_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("GWS_API_TOKEN", "environment-secret")
-    monkeypatch.setenv("GWS_ALLOWED_GIT_HOSTS", "GitHub.com,git.example.com:8443")
-    monkeypatch.setenv("GWS_MAX_REQUEST_BODY_BYTES", "8192")
-    monkeypatch.setenv("GWS_CA_BUNDLE", "")
+    monkeypatch.setenv("KAGEMUSHA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KAGEMUSHA_API_TOKEN", "environment-secret")
+    monkeypatch.setenv("KAGEMUSHA_ALLOWED_GIT_HOSTS", "GitHub.com,git.example.com:8443")
+    monkeypatch.setenv("KAGEMUSHA_MAX_REQUEST_BODY_BYTES", "8192")
+    monkeypatch.setenv("KAGEMUSHA_CA_BUNDLE", "")
     settings = Settings()
     assert settings.data_dir == tmp_path
     assert settings.allowed_git_hosts == frozenset(

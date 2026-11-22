@@ -19,9 +19,21 @@ def test_startup_recovers_partial_projects_and_stale_temp_resources(
         assert initialize(client, remote, auth).status_code == 201
         cache = settings.projects_dir / "project-a.git"
         commit = git("--git-dir", str(cache), "rev-parse", "main")
-        git("--git-dir", str(cache), "update-ref", "refs/gws/snapshots/stale", commit)
-        git("--git-dir", str(cache), "update-ref", "refs/gws/snapshots/recent", commit)
-        stale_ref = cache / "refs" / "gws" / "snapshots" / "stale"
+        git(
+            "--git-dir",
+            str(cache),
+            "update-ref",
+            "refs/kagemusha/snapshots/stale",
+            commit,
+        )
+        git(
+            "--git-dir",
+            str(cache),
+            "update-ref",
+            "refs/kagemusha/snapshots/recent",
+            commit,
+        )
+        stale_ref = cache / "refs" / "kagemusha" / "snapshots" / "stale"
         stale_temp = settings.tmp_dir / "copy-stale"
         recent_temp = settings.tmp_dir / "copy-recent"
         stale_temp.mkdir()
@@ -40,6 +52,6 @@ def test_startup_recovers_partial_projects_and_stale_temp_resources(
         assert not (settings.metadata_dir / "missing-repo.json").exists()
         assert not stale_temp.exists()
         assert recent_temp.exists()
-        refs = git("--git-dir", str(cache), "for-each-ref", "refs/gws/snapshots")
+        refs = git("--git-dir", str(cache), "for-each-ref", "refs/kagemusha/snapshots")
         assert "snapshots/stale" not in refs
         assert "snapshots/recent" in refs

@@ -23,6 +23,7 @@ class ProjectRequest(ApiModel):
 class CopyRequest(ApiModel):
     ref: str = Field(min_length=1, max_length=255)
     depth: int | None = Field(default=None, strict=True, ge=0, le=1000)
+    branch_prefix: str | None = Field(default=None, min_length=1, max_length=128)
     credential: Credential
 
 

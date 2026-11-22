@@ -25,6 +25,7 @@ FROM docker.io/library/python:3.15.2-slim-trixie
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        git \
+       git-lfs \
        tar \
        zstd \
        ca-certificates \
@@ -39,7 +40,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    GWS_DATA_DIR=/data
+    KAGEMUSHA_DATA_DIR=/data
 
 RUN groupadd --system app \
     && useradd --system --gid app app \
