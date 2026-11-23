@@ -11,7 +11,7 @@ from fastapi import Request, Response
 from .errors import ErrorCode
 
 _LOG_FIELDS = (
-    "project_id",
+    "repository_id",
     "operation",
     "provider",
     "ref",

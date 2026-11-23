@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from kagemusha.app import create_app
 from kagemusha.config import Settings
+from kagemusha.worker import Worker
 
 from .git_server import GitHttpsServer, GitRemote
 from .helpers import seed_repository
@@ -53,9 +55,11 @@ def settings(remote: GitRemote, tmp_path: Path) -> Settings:
     return Settings(
         data_dir=tmp_path / "data",
         api_token="service-test-token",
+        git_credentials={"test-reader": "test-git-token"},
         allowed_git_hosts=remote.allowed_hosts,
         ca_bundle=remote.ca_bundle,
         git_timeout_seconds=30,
+        worker_poll_seconds=0.01,
     )
 
 
@@ -70,24 +74,31 @@ def auth() -> dict[str, str]:
     return {"Authorization": "Bearer service-test-token"}
 
 
-@pytest.fixture
-def credential() -> dict[str, dict[str, str]]:
-    return {"credential": {"type": "token", "token": "test-git-token"}}
-
-
-def initialize(
+def register_repository(
     client: TestClient,
     remote: GitRemote,
     auth: dict[str, str],
+    *,
     provider: str = "gitlab",
-    project_id: str = "project-a",
+    repository_id: str = "repository-a",
 ):
-    return client.post(
-        f"/projects/{project_id}",
+    return client.put(
+        f"/repositories/{repository_id}",
         headers=auth,
         json={
-            "repository": remote.url,
-            "provider": provider,
-            "credential": {"type": "token", "token": "test-git-token"},
+            "name": "Test Repository",
+            "remote_url": remote.url,
+            "git_provider": provider,
+            "default_ref": "main",
+            "credential_ref": "test-reader",
         },
     )
+
+
+def run_worker(settings: Settings, count: int = 1) -> None:
+    async def run() -> None:
+        worker = Worker(settings)
+        for _ in range(count):
+            await worker.run(once=True)
+
+    asyncio.run(run())

@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import BeforeValidator, Field, FilePath, model_validator
+from pydantic import BeforeValidator, Field, FilePath, SecretStr, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _HOST = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::[0-9]{1,5})?$")
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     )
 
     data_dir: Path
-    api_token: str = Field(min_length=16, max_length=4096)
+    api_token: str | None = Field(default=None, min_length=16, max_length=4096)
     allowed_git_hosts: Annotated[frozenset[str], NoDecode, BeforeValidator(_hosts)] = (
         frozenset({"github.com", "gitlab.com"})
     )
@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     temp_budget_bytes: int = Field(default=2 * 1024**3, ge=1)
     max_submodules: int = Field(default=100, ge=0, le=1000)
     max_submodule_depth: int = Field(default=10, ge=0, le=100)
+    git_credentials: dict[str, SecretStr] = Field(default_factory=dict)
+    worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
+    job_lease_seconds: int = Field(default=900, ge=30)
+    seed_timeout_seconds: int = Field(default=1800, ge=60)
+    process_terminate_grace_seconds: int = Field(default=10, ge=1, le=60)
+    max_process_output_bytes: int = Field(default=1024 * 1024, ge=1024)
+    copy_default_ttl_seconds: int = Field(default=3600, ge=60)
+    copy_max_ttl_seconds: int = Field(default=86400, ge=60)
+    snapshot_retention_count: int = Field(default=3, ge=0, le=100)
+    default_java_version: str = "21"
+    default_node_version: str = "22"
+    default_pnpm_version: str = "10"
     ca_bundle: FilePath | None = None
 
     @model_validator(mode="after")
@@ -79,12 +91,12 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def projects_dir(self) -> Path:
-        return self.data_dir / "projects"
+    def database_path(self) -> Path:
+        return self.data_dir / "kagemusha.db"
 
     @property
-    def metadata_dir(self) -> Path:
-        return self.data_dir / "metadata"
+    def mirrors_dir(self) -> Path:
+        return self.data_dir / "git" / "mirrors"
 
     @property
     def locks_dir(self) -> Path:
@@ -92,7 +104,35 @@ class Settings(BaseSettings):
 
     @property
     def tmp_dir(self) -> Path:
-        return self.data_dir / "tmp"
+        return self.data_dir / "copies" / "staging"
+
+    @property
+    def copies_dir(self) -> Path:
+        return self.data_dir / "copies" / "artifacts"
+
+    @property
+    def cache_work_dir(self) -> Path:
+        return self.data_dir / "cache" / "work"
+
+    @property
+    def cache_staging_dir(self) -> Path:
+        return self.data_dir / "cache" / "staging"
+
+    @property
+    def cache_snapshots_dir(self) -> Path:
+        return self.data_dir / "cache" / "snapshots"
+
+    @property
+    def mise_data_dir(self) -> Path:
+        return self.data_dir / "mise"
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.data_dir / "backups"
+
+    @property
+    def jobs_dir(self) -> Path:
+        return self.data_dir / "jobs"
 
     @property
     def askpass_path(self) -> Path:
@@ -100,9 +140,21 @@ class Settings(BaseSettings):
 
     def ensure_directories(self) -> None:
         for directory in (
-            self.projects_dir,
-            self.metadata_dir,
+            self.mirrors_dir,
             self.locks_dir,
             self.tmp_dir,
+            self.copies_dir,
+            self.cache_work_dir,
+            self.cache_staging_dir,
+            self.cache_snapshots_dir,
+            self.mise_data_dir,
+            self.backups_dir,
+            self.jobs_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+
+    def credential(self, reference: str | None) -> str | None:
+        if reference is None:
+            return None
+        value = self.git_credentials.get(reference)
+        return value.get_secret_value() if value is not None else None

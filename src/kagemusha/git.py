@@ -6,7 +6,7 @@ import socket
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .config import Settings
 from .errors import (
@@ -18,6 +18,24 @@ from .errors import (
 from .process import ProcessRunner, isolated_environment
 
 _BLOCKED_HOSTS = {"metadata", "metadata.google.internal", "169.254.169.254"}
+
+
+def canonicalize_repository_url(repository: str) -> str:
+    try:
+        parsed = urlsplit(repository.strip())
+        port = parsed.port
+    except ValueError as error:
+        raise invalid_request("Invalid repository URL") from error
+    if parsed.hostname is None:
+        raise invalid_request("Invalid repository URL")
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    authority = host if port in {None, 443} else f"{host}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit(
+        (parsed.scheme.lower(), authority, path, parsed.query, parsed.fragment)
+    )
 
 
 def validate_repository_url(repository: str, settings: Settings) -> None:
@@ -130,14 +148,14 @@ def _git_environment(
         if settings.ca_bundle is not None:
             env["SSL_CERT_FILE"] = str(settings.ca_bundle)
         if token is not None:
-            if provider not in {"github", "gitlab"}:
+            if provider not in {"github", "gitlab", "generic"}:
                 raise ValueError("A provider is required for authenticated Git")
             env.update(
                 {
                     "GIT_ASKPASS": str(settings.askpass_path),
                     "KAGEMUSHA_GIT_USERNAME": "x-access-token"
                     if provider == "github"
-                    else "oauth2",
+                    else ("oauth2" if provider == "gitlab" else "git"),
                     "KAGEMUSHA_GIT_TOKEN": token,
                 }
             )

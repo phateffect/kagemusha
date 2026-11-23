@@ -18,13 +18,13 @@ from .git import (
     validate_resolved_addresses,
 )
 from .process import ProcessRunner
-from .repository import Project, RepositoryManager
+from .repository import Repository, RepositoryManager
 
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceResult:
     root: Path
-    archive: Path
+    archive: Path | None
     commit: str
     fetch_duration_ms: int
     workspace_duration_ms: int
@@ -43,12 +43,15 @@ class WorkspaceManager:
 
     async def create(
         self,
-        project: Project,
+        repository: Repository,
         remote_ref: str,
         branch: str | None,
         tracks_remote: bool,
-        token: str,
+        token: str | None,
         depth: int,
+        mode: str = "git",
+        *,
+        produce_archive: bool = True,
     ) -> WorkspaceResult:
         if not 0 <= depth <= self.settings.max_depth:
             raise ServiceError(
@@ -60,7 +63,7 @@ class WorkspaceManager:
         try:
             await ensure_temp_capacity(self.settings)
             snapshot, commit, fetch_ms = await self.repositories.fetch_snapshot(
-                project, remote_ref, token
+                repository, remote_ref, token
             )
             workspace_started = time.monotonic()
             root.mkdir(mode=0o700)
@@ -83,7 +86,7 @@ class WorkspaceManager:
             if depth > 0:
                 fetch_arguments.append(f"--depth={depth}")
             fetch_arguments.extend(
-                (f"file://{self.repositories.bare_path(project.id)}", snapshot)
+                (f"file://{self.repositories.bare_path(repository.id)}", snapshot)
             )
             await run_git(
                 self.settings,
@@ -95,7 +98,14 @@ class WorkspaceManager:
             await run_git(
                 self.settings,
                 self.runner,
-                ("-C", str(workspace), "remote", "add", "origin", project.repository),
+                (
+                    "-C",
+                    str(workspace),
+                    "remote",
+                    "add",
+                    "origin",
+                    repository.remote_url,
+                ),
                 operation="configure workspace origin",
                 local=True,
             )
@@ -142,24 +152,32 @@ class WorkspaceManager:
             for name in ("FETCH_HEAD", "ORIG_HEAD"):
                 (workspace / ".git" / name).unlink(missing_ok=True)
             await self._hydrate_lfs(
-                workspace, project.repository, project.provider, token, root
+                workspace, repository.remote_url, repository.git_provider, token, root
             )
             counter = [0]
             await self._hydrate_submodules(
                 workspace,
-                project.repository,
-                project.provider,
+                repository.remote_url,
+                repository.git_provider,
                 token,
                 root,
                 level=0,
                 counter=counter,
             )
             await self._verify_workspace(workspace, commit, depth, branch)
+            if mode == "source":
+                await anyio.to_thread.run_sync(_strip_git_metadata, workspace)
+            elif mode != "git":
+                raise ServiceError(ErrorCode.INVALID_REQUEST, "Invalid copy mode")
             workspace_ms = int((time.monotonic() - workspace_started) * 1000)
-            archive_started = time.monotonic()
-            archive, size = await create_archive(self.settings, self.runner, root)
-            archive_ms = int((time.monotonic() - archive_started) * 1000)
-            await self.repositories.delete_snapshot(project.id, snapshot)
+            archive = None
+            size = 0
+            archive_ms = 0
+            if produce_archive:
+                archive_started = time.monotonic()
+                archive, size = await create_archive(self.settings, self.runner, root)
+                archive_ms = int((time.monotonic() - archive_started) * 1000)
+            await self.repositories.delete_snapshot(repository.id, snapshot)
             snapshot = ""
             return WorkspaceResult(
                 root=root,
@@ -176,7 +194,7 @@ class WorkspaceManager:
             raise
         finally:
             if snapshot:
-                await self.repositories.delete_snapshot(project.id, snapshot)
+                await self.repositories.delete_snapshot(repository.id, snapshot)
 
     async def _hydrate_submodules(
         self,
@@ -443,3 +461,14 @@ def _url_authority(url: str) -> tuple[str, int]:
     if parsed.hostname is None:
         raise ServiceError(ErrorCode.INVALID_REQUEST, "Invalid repository URL")
     return parsed.hostname.lower(), parsed.port or 443
+
+
+def _strip_git_metadata(workspace: Path) -> None:
+    paths = sorted(
+        workspace.rglob(".git"), key=lambda path: len(path.parts), reverse=True
+    )
+    for path in paths:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)

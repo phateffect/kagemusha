@@ -4,11 +4,15 @@ version = "0.1.0"
 description = "Git clones that fight your battles."
 requires-python = ">=3.15,<3.16"
 dependencies = [
+    "aiosqlite>=0.22,<1",
     "fastapi>=0.115,<1",
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.10,<3",
     "uvicorn>=0.34,<1",
 ]
+
+[project.scripts]
+kagemusha = "kagemusha.main:main"
 
 [build-system]
 requires = ["hatchling>=1.27,<2"]

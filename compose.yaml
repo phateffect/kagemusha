@@ -1,56 +1,69 @@
+x-kagemusha-common: &kagemusha-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: localhost/kagemusha:local
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 30s
+  volumes:
+    - kagemusha-data:/data
+  environment: &kagemusha-environment
+    KAGEMUSHA_DATA_DIR: /data
+    KAGEMUSHA_ALLOWED_GIT_HOSTS: ${KAGEMUSHA_ALLOWED_GIT_HOSTS:-github.com,gitlab.com}
+    KAGEMUSHA_CA_BUNDLE: ${KAGEMUSHA_CA_BUNDLE:-}
+    KAGEMUSHA_GIT_CREDENTIALS: ${KAGEMUSHA_GIT_CREDENTIALS:-{}}
+    KAGEMUSHA_MAX_CONCURRENT_GIT: "4"
+    KAGEMUSHA_GIT_TIMEOUT_SECONDS: "300"
+    KAGEMUSHA_SEED_TIMEOUT_SECONDS: "1800"
+    KAGEMUSHA_JOB_LEASE_SECONDS: "900"
+    KAGEMUSHA_DEFAULT_DEPTH: "50"
+    KAGEMUSHA_MAX_DEPTH: "1000"
+    KAGEMUSHA_ZSTD_LEVEL: "3"
+    KAGEMUSHA_ZSTD_THREADS: "1"
+    KAGEMUSHA_MAX_ARCHIVE_BYTES: "1073741824"
+    KAGEMUSHA_MAX_REQUEST_BODY_BYTES: "65536"
+    KAGEMUSHA_TEMP_BUDGET_BYTES: "2147483648"
+    KAGEMUSHA_TEMP_TTL_SECONDS: "3600"
+    KAGEMUSHA_MAX_SUBMODULES: "100"
+    KAGEMUSHA_MAX_SUBMODULE_DEPTH: "10"
+    KAGEMUSHA_COPY_DEFAULT_TTL_SECONDS: "3600"
+    KAGEMUSHA_COPY_MAX_TTL_SECONDS: "86400"
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 4G
+
 services:
-  kagemusha:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
-    image: localhost/kagemusha:local
-
-    restart: unless-stopped
-
-    init: true
-
+  api:
+    <<: *kagemusha-common
+    command: ["kagemusha", "serve"]
+    environment:
+      <<: *kagemusha-environment
+      KAGEMUSHA_API_TOKEN: ${KAGEMUSHA_API_TOKEN:?required}
     ports:
       - "127.0.0.1:${KAGEMUSHA_HTTP_PORT:-8000}:8000"
-
-    environment:
-      KAGEMUSHA_DATA_DIR: /data
-      KAGEMUSHA_API_TOKEN: ${KAGEMUSHA_API_TOKEN:?required}
-
-      KAGEMUSHA_MAX_CONCURRENT_GIT: "4"
-      KAGEMUSHA_GIT_TIMEOUT_SECONDS: "300"
-
-      KAGEMUSHA_DEFAULT_DEPTH: "50"
-      KAGEMUSHA_MAX_DEPTH: "1000"
-
-      KAGEMUSHA_ZSTD_LEVEL: "3"
-      KAGEMUSHA_ZSTD_THREADS: "1"
-
-      KAGEMUSHA_MAX_ARCHIVE_BYTES: "1073741824"
-      KAGEMUSHA_MAX_REQUEST_BODY_BYTES: "65536"
-      KAGEMUSHA_TEMP_BUDGET_BYTES: "2147483648"
-      KAGEMUSHA_TEMP_TTL_SECONDS: "3600"
-      KAGEMUSHA_MAX_SUBMODULES: "100"
-      KAGEMUSHA_MAX_SUBMODULE_DEPTH: "10"
-
-      KAGEMUSHA_ALLOWED_GIT_HOSTS: ${KAGEMUSHA_ALLOWED_GIT_HOSTS:-github.com,gitlab.com}
-      KAGEMUSHA_CA_BUNDLE: ${KAGEMUSHA_CA_BUNDLE:-}
-
-    volumes:
-      - kagemusha-data:/data
-
-    stop_grace_period: 30s
-
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 5s
+
+  worker:
+    <<: *kagemusha-common
+    command: ["kagemusha", "worker"]
+    healthcheck:
+      test: ["CMD", "kagemusha", "worker-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
 volumes:
   kagemusha-data:

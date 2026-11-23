@@ -1,1692 +1,1663 @@
-# Git Workspace Service — Implementation Specification
+# SPEC — Kagemusha v2
 
-**Version:** 1.1  
-**Status:** Ready for Implementation  
-**Language:** Python  
-**Deployment:** Docker Compose  
-**Purpose:** Git Repository Cache & Portable Workspace Generation
+## Git Repository, Working Copy & Dependency Cache Management
 
----
-
-# 1. 项目概述
-
-## 1.1 背景
-
-我们正在构建一个基于 E2B Sandbox 的 Coding Agent 平台。
-
-外部 Orchestrator 负责创建 Agent Task、管理 Sandbox、调度 Agent 执行工作。
-
-为了避免每个 Sandbox 都需要 Git 凭证并重复从远程仓库 Clone 代码，需要实现独立的 Git Workspace Service。
-
-该服务负责：
-
-1. 初始化远端 Git 仓库的本地缓存。
-2. 按需 Fetch 最新远端 Ref。
-3. 生成指定 Commit 的独立 Working Copy。
-4. 可选限制 Git 历史深度。
-5. 压缩并通过 HTTP 返回 Workspace。
-6. 保证用户 Git 凭证不会进入 Workspace。
-
-服务本身不管理 E2B，也不负责 Agent 任务生命周期。
-
-## 1.2 设计原则
-
-- Simple：尽量少的组件与抽象。
-- Stateless Credentials：不持久化用户凭证。
-- Stateful Cache：持久化 Git 仓库缓存。
-- Portable Workspace：Workspace 不依赖服务器文件系统。
-- Secure by Default：隔离凭证、限制远程访问。
-- Reproducible：每个 Workspace 对应确定的 Commit SHA。
-- Concurrency Safe：支持同一个 Project 并发创建多个 Workspace。
-- Minimal Dependencies：优先使用成熟的系统 Git CLI。
-
-## 1.3 不采用的技术
-
-第一版不引入：
-
-- GitPython
-- pygit2
-- libgit2
-- gh / glab
-- PostgreSQL / SQLite
-- Redis
-- Celery
-- Kubernetes
-- E2B SDK
-- 对象存储
+**Status:** Approved for implementation
+**Version:** 2.0
+**Language:** Python 3.15.2 / uv 0.13.9
+**Deployment:** Docker Compose
+**Database:** SQLite
+**Toolchains:** mise / Gradle Wrapper / pnpm
+**Target platform:** Linux amd64
 
 ---
 
-# 2. 技术栈
+# 1. Project Overview
 
-| 组件 | 选型 |
+Kagemusha is a self-hosted service responsible for preparing development workspaces for coding agents and other ephemeral execution environments.
+
+It provides two primary capabilities:
+
+1. Git repository and Working Copy management.
+2. Shared development dependency cache preparation.
+
+Kagemusha is designed to work with an external Orchestrator, but it must remain independently usable.
+
+It must not depend on E2B, any specific coding agent, CI platform, or cloud vendor.
+
+### Design principles
+
+1. Single-host deployment.
+2. Persistent state with SQLite and Docker Volumes.
+3. Stateless HTTP API processes.
+4. Independent background Worker.
+5. Reuse existing CLI tools rather than reimplementing Git, Gradle, mise or pnpm.
+6. Shared caches across repositories.
+7. Immutable, reproducible published artifacts.
+8. Incremental cache preparation.
+9. Explicit failure handling and crash recovery.
+10. Minimal operational complexity.
+
+Because Kagemusha has not been released, existing internal API and schema designs may be replaced without backward-compatibility requirements.
+
+Preserve working functionality and tests where useful, but prefer a consistent architecture over retaining obsolete abstractions.
+
+---
+
+# 2. Responsibilities and Boundaries
+
+## 2.1 Kagemusha owns
+
+- Git repository registration.
+- Git authentication credential references.
+- Git mirror storage.
+- Repository synchronization.
+- Working Copy creation and archival.
+- Working Copy lifecycle and cleanup.
+- Project toolchain detection.
+- Dependency cache seeding.
+- Cache compatibility grouping.
+- Cache snapshot publishing.
+- Incremental cache state.
+- Cache artifact retrieval.
+- Cache metadata and background jobs.
+
+## 2.2 External Orchestrator owns
+
+- Business projects.
+- Coding tasks.
+- Agent sessions.
+- Task scheduling.
+- E2B Sandbox creation.
+- E2B Template construction.
+- Agent permissions and execution policies.
+- Deployment and CD.
+
+Kagemusha must not contain domain models such as Agent, Task or Sandbox.
+
+External systems should interact through stable HTTP APIs.
+
+## 2.3 Naming
+
+Use the following terminology consistently:
+
+| Term | Definition |
 |---|---|
-| Language | Python 3.13 |
-| Package Manager | uv |
-| HTTP Framework | FastAPI |
-| ASGI | Uvicorn |
-| Git | Git CLI |
-| Archive | GNU tar |
-| Compression | Zstandard |
-| Subprocess | asyncio |
-| Lock | Linux flock |
-| Tests | pytest + httpx2 |
-| Container | Docker |
-| Base Image | Debian Trixie Slim |
-| Orchestration | Docker Compose |
-| Storage | Docker Named Volume |
+| Repository | Registered remote Git repository |
+| Mirror | Local bare Git mirror |
+| Revision | Resolved Git commit SHA |
+| Working Copy | Isolated source copy created from a revision |
+| Seed Target | Repository + subdirectory + provider |
+| Provider | Gradle or pnpm cache implementation |
+| Cache Group | Set of mutually compatible cache contents |
+| Cache Store | Mutable dependency store used during seeding |
+| Cache Snapshot | Immutable published cache artifact |
+| Seed Job | Background execution that updates cache contents |
 
-Python 负责请求验证、流程编排和子进程管理。
-
-Git CLI 负责所有 Git 操作。
-
-GNU tar 和 zstd 负责压缩归档。
-
-不自行实现 Git Protocol。
+Avoid using `Project` as an internal synonym for `Repository`.
 
 ---
 
-# 3. 系统架构
+# 3. System Architecture
 
-```text
-                   Agent Orchestrator
-                           |
-                           | HTTPS
-                           | Git Token (per request)
-                           v
-                 Git Workspace Service
-                  Python + FastAPI
-                           |
-             +-------------+-------------+
-             |             |             |
-          Git CLI      Git Cache      tar + zstd
-             |             |             |
-             |       Bare Repository     |
-             |       Docker Volume       |
-             |             |             |
-             +-------------+-------------+
-                           |
-                           v
-                    workspace.tar.zst
-                           |
-                           v
-                   Agent Orchestrator
-                           |
-                           | E2B Files API
-                           v
-                       E2B Sandbox
-                           |
-                           v
-                        Pi Agent
+Use a single Python codebase with two process entrypoints:
+
+```bash
+kagemusha serve
+kagemusha worker
 ```
 
-## 3.1 组件职责
+A CLI entrypoint may also expose administrative commands:
 
-### Orchestrator
+```bash
+kagemusha db migrate
+kagemusha db backup
+kagemusha cache verify
+kagemusha cache gc
+```
 
-负责：
+The HTTP API handles requests and metadata operations.
 
-- 用户认证与权限管理
-- 用户 Git Token 的提供与管理
-- Project ID 分配
-- Task 生命周期管理
-- Sandbox 生命周期管理
-- Workspace 归档下载与上传
-- 后续 Push、创建 PR/MR
+The Worker handles operations that can take significant time or consume substantial resources:
 
-### Git Workspace Service
+- Git fetch.
+- Working Copy archive creation.
+- mise installation.
+- Gradle execution.
+- pnpm execution.
+- Cache snapshot creation.
+- Cache validation.
 
-负责：
+Do not execute long-running tasks inside HTTP request handlers.
 
-- Git Repo 初始化
-- Git Repo 缓存
-- Fetch
-- Ref 解析
-- Workspace 生成
-- Git 历史截断
-- 打包压缩
-- 归档交付
+## 3.1 Suggested Python modules
 
-### E2B Sandbox
+```text
+src/kagemusha/
+├── main.py
+├── config.py
+├── api/
+│   ├── repositories.py
+│   ├── copies.py
+│   ├── cache_jobs.py
+│   └── cache_snapshots.py
+├── db/
+│   ├── models.py
+│   ├── migrations/
+│   └── repository.py
+├── git/
+│   ├── mirror.py
+│   ├── credentials.py
+│   └── working_copy.py
+├── cache/
+│   ├── manager.py
+│   ├── fingerprint.py
+│   ├── snapshot.py
+│   ├── storage.py
+│   └── providers/
+│       ├── gradle.py
+│       └── pnpm.py
+├── jobs/
+│   ├── worker.py
+│   ├── queue.py
+│   └── executor.py
+└── cli/
+    └── commands.py
+```
 
-负责：
+This is a suggested structure, not an instruction to create unnecessary layers.
 
-- 解压 Workspace
-- 运行 Agent
-- 修改代码
-- 创建 Commit
-
-E2B 不需要 Git Token。
+Keep modules small and responsibilities explicit.
 
 ---
 
-# 4. 数据模型与存储
+# 4. Repository Management
 
-## 4.1 Project
+## 4.1 Repository model
 
-Project 是一个持久化的 Git 仓库缓存。
+Each Repository contains:
 
-每个 Project 由外部控制器生成的 ID 标识。
+```text
+id
+name
+remote_url
+provider
+default_ref
+credential_ref
+status
+last_fetched_at
+created_at
+updated_at
+```
 
-元数据：
+`provider` refers to Git hosting, such as GitHub, GitLab or generic Git, and must not be confused with a cache provider.
+
+The caller may supply a Repository ID. IDs must be unique.
+
+`remote_url` must be canonicalized and validated.
+
+Store credentials separately from public repository metadata.
+
+## 4.2 Registration
+
+```http
+PUT /repositories/{repository_id}
+```
+
+Example:
 
 ```json
 {
-  "id": "project-a",
-  "repository": "https://gitlab.example.com/team/project.git",
-  "provider": "gitlab",
-  "default_branch": "main"
+  "name": "customer-service-api",
+  "remote_url": "https://gitlab.example.com/team/api.git",
+  "default_ref": "main",
+  "credential_ref": "gitlab-ci-reader"
 }
 ```
 
-Project 元数据不包含任何凭证。
+The operation should be idempotent.
 
-## 4.2 持久化目录
+Updating the remote URL or credential association must trigger appropriate mirror consistency checks.
+
+## 4.3 Repository synchronization
+
+```http
+POST /repositories/{repository_id}/fetch
+```
+
+Response:
+
+```json
+{
+  "job_id": "job-123",
+  "status": "queued"
+}
+```
+
+Fetch must be executed asynchronously by the Worker.
+
+Use existing Git CLI commands and Git mirror mechanisms.
+
+Ensure that concurrent operations on the same mirror do not corrupt repository state.
+
+Apply per-repository operation locks.
+
+## 4.4 Git credentials
+
+Support:
+
+- GitHub token.
+- GitLab token.
+- Generic HTTPS credentials where applicable.
+- Existing Kagemusha supported SSH credentials, if implemented.
+
+Use gh/glab where their capabilities are useful, but Git CLI remains the source of truth for clone/fetch behavior.
+
+Do not require gh or glab for generic Git repositories.
+
+Store only a credential reference in Repository metadata.
+
+Secrets must not appear in API responses, archive contents or logs.
+
+---
+
+# 5. Working Copy Management
+
+## 5.1 Creation
+
+```http
+POST /repositories/{repository_id}/copies
+```
+
+Example:
+
+```json
+{
+  "ref": "main",
+  "depth": 1,
+  "ttl_seconds": 3600
+}
+```
+
+Resolve the Git ref to an immutable commit SHA before creating the copy.
+
+A copy created from `main` must record the exact commit, not only the branch name.
+
+A valid `depth` option must have documented semantics. Do not apply arbitrary truncation that makes a requested Git revision unavailable.
+
+## 5.2 Source archive
+
+Produce `tar.zst` archives.
+
+A copy should include the intended Git working tree content, plus `.git` metadata only when requested by the supported copy mode.
+
+Provide two explicit modes:
+
+- `source`: source tree only.
+- `git`: working directory with usable Git metadata, suitable for agents that must commit or push.
+
+Do not silently deliver a source-only archive when the caller expects a fully functional Git checkout.
+
+For `git` mode, preserve the required repository metadata without embedding server credentials or leaking internal mirror paths.
+
+Use safe, portable Git mechanisms and verify that the restored copy can execute the required Git operations.
+
+## 5.3 Retrieval
+
+```http
+GET /copies/{copy_id}
+GET /copies/{copy_id}/download
+DELETE /copies/{copy_id}
+```
+
+Return snapshot metadata and a streamed artifact download.
+
+A Working Copy must not have an implicit dependency on a Cache Snapshot.
+
+The external Orchestrator independently selects source and dependency cache artifacts.
+
+## 5.4 Cleanup
+
+Support TTL-based cleanup.
+
+Do not remove a copy while it is being created or downloaded.
+
+Use a safe state transition before deletion.
+
+---
+
+# 6. Database Design
+
+Use SQLite as the single durable metadata database.
+
+Configuration:
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+```
+
+Use a formal migration system.
+
+All database transactions must be short.
+
+Never hold a database transaction while running Git, Gradle, pnpm, mise, compression or network operations.
+
+## 6.1 Tables
+
+Use the following logical schema.
+
+### repositories
+
+```text
+id                    TEXT PRIMARY KEY
+name                  TEXT NOT NULL
+remote_url            TEXT NOT NULL
+git_provider          TEXT NOT NULL
+default_ref           TEXT NOT NULL
+credential_ref        TEXT
+status                TEXT NOT NULL
+last_fetched_at       TEXT
+created_at            TEXT NOT NULL
+updated_at            TEXT NOT NULL
+```
+
+### working_copies
+
+```text
+id                    TEXT PRIMARY KEY
+repository_id         TEXT NOT NULL
+requested_ref         TEXT NOT NULL
+commit_sha            TEXT NOT NULL
+mode                  TEXT NOT NULL
+status                TEXT NOT NULL
+artifact_path         TEXT
+artifact_sha256       TEXT
+created_at            TEXT NOT NULL
+expires_at            TEXT
+error                 TEXT
+```
+
+### jobs
+
+Use one common job system for Git and Cache operations.
+
+```text
+id                    TEXT PRIMARY KEY
+type                  TEXT NOT NULL
+status                TEXT NOT NULL
+payload_json          TEXT NOT NULL
+result_json           TEXT
+attempt               INTEGER NOT NULL DEFAULT 0
+worker_id             TEXT
+lease_expires_at      TEXT
+created_at            TEXT NOT NULL
+started_at            TEXT
+finished_at           TEXT
+error                 TEXT
+```
+
+### seed_targets
+
+Each entry represents one cache target inside a repository.
+
+```text
+id                    TEXT PRIMARY KEY
+repository_id         TEXT NOT NULL
+relative_path         TEXT NOT NULL
+provider              TEXT NOT NULL
+enabled               INTEGER NOT NULL
+config_json           TEXT NOT NULL
+created_at            TEXT NOT NULL
+updated_at            TEXT NOT NULL
+```
+
+Enforce uniqueness on:
+
+```text
+(repository_id, relative_path, provider)
+```
+
+### cache_groups
+
+```text
+id                    TEXT PRIMARY KEY
+provider              TEXT NOT NULL
+compatibility_key     TEXT NOT NULL
+platform              TEXT NOT NULL
+active_snapshot_id    TEXT
+created_at            TEXT NOT NULL
+```
+
+`compatibility_key` describes the cache format compatibility requirements.
+
+Do not require identical Kotlin, Quarkus or JDK versions to share a Gradle dependency store.
+
+### cache_seed_states
+
+```text
+target_id             TEXT NOT NULL
+cache_group_id        TEXT NOT NULL
+commit_sha            TEXT NOT NULL
+fingerprint           TEXT NOT NULL
+snapshot_id           TEXT NOT NULL
+seeded_at             TEXT NOT NULL
+
+PRIMARY KEY (target_id, cache_group_id)
+```
+
+This table represents successfully **published** seed state, not merely a finished subprocess.
+
+### cache_snapshots
+
+```text
+id                    TEXT PRIMARY KEY
+cache_group_id        TEXT NOT NULL
+status                TEXT NOT NULL
+artifact_path         TEXT NOT NULL
+artifact_sha256       TEXT NOT NULL
+artifact_size         INTEGER NOT NULL
+manifest_path         TEXT NOT NULL
+created_at            TEXT NOT NULL
+published_at          TEXT
+```
+
+### cache_snapshot_targets
+
+```text
+snapshot_id           TEXT NOT NULL
+target_id             TEXT NOT NULL
+commit_sha            TEXT NOT NULL
+fingerprint           TEXT NOT NULL
+
+PRIMARY KEY (snapshot_id, target_id)
+```
+
+The association table is critical for traceability and incremental seeding.
+
+### Additional requirements
+
+- Foreign keys for references.
+- Unique constraints and indexes.
+- Validated state transitions.
+- UTC timestamps.
+- Schema migrations.
+- Integrity checks.
+- Safe handling of partially published artifacts.
+
+Use SQLite transactions when updating a published snapshot pointer and the corresponding seed states.
+
+The filesystem cannot participate in SQLite transactions; publish artifacts to their final immutable paths before committing the metadata transaction.
+
+---
+
+# 7. Toolchain Detection
+
+Kagemusha supports two cache providers:
+
+- Gradle.
+- pnpm.
+
+mise is a toolchain manager, not a cache provider in V1.
+
+## 7.1 Detection
+
+Detect Gradle from:
+
+```text
+gradlew
+gradle/wrapper/gradle-wrapper.properties
+settings.gradle
+settings.gradle.kts
+```
+
+Detect pnpm from:
+
+```text
+pnpm-lock.yaml
+package.json
+pnpm-workspace.yaml
+```
+
+Detection must support monorepos.
+
+For example:
+
+```text
+repository/
+├── backend/
+│   ├── gradlew
+│   └── build.gradle.kts
+├── frontend/
+│   ├── package.json
+│   └── pnpm-lock.yaml
+└── admin/
+    └── package.json
+```
+
+The Seeder should create separate targets for `backend` and the correct pnpm workspace root.
+
+Do not automatically seed the same pnpm workspace multiple times because it contains multiple packages.
+
+## 7.2 Configuration
+
+A Repository can declare targets explicitly:
+
+```yaml
+cache:
+  targets:
+    - path: backend
+      provider: gradle
+      tasks:
+        - classes
+        - testClasses
+
+    - path: frontend
+      provider: pnpm
+```
+
+Support automatic detection as the default.
+
+Allow administrators to override incorrect detection.
+
+Detection results must be queryable without triggering seeding.
+
+---
+
+# 8. mise Toolchain Management
+
+Use mise to select and install tools.
+
+Supported project configuration includes:
+
+```text
+mise.toml
+.mise.toml
+.tool-versions
+```
+
+Respect project-defined versions.
+
+For Gradle, always use the project's `./gradlew`.
+
+For pnpm, use the version selected by the supported mise/package-manager configuration.
+
+Record the resolved exact tool versions.
+
+Set persistent mise directories under:
+
+```text
+/data/mise/
+```
+
+Use documented mise environment variables, such as `MISE_DATA_DIR`, rather than inventing environment variable names.
+
+Tools downloaded during one Seed Job should be reusable by later jobs.
+
+### Missing toolchain versions
+
+If a project does not declare a version:
+
+1. Use an explicit Kagemusha default.
+2. Record that a fallback was used.
+3. Do not silently depend on whichever binary happens to be in `PATH`.
+
+### Security
+
+Project mise configurations may contain hooks or environment directives.
+
+Treat them as executable project configuration.
+
+Do not execute untrusted project configurations with unrestricted service credentials.
+
+---
+
+# 9. Gradle Cache Provider
+
+## 9.1 Shared Gradle User Home
+
+All Gradle Seed Targets in a compatible seeding environment should share one mutable dependency cache.
+
+Example:
+
+```text
+/data/cache/work/gradle/
+```
+
+Set:
+
+```bash
+GRADLE_USER_HOME=/data/cache/work/gradle
+```
+
+Each target runs its own Wrapper:
+
+```bash
+mise exec -- ./gradlew classes testClasses --no-daemon
+```
+
+The configured tasks may differ by project.
+
+Do not assume `dependencies` resolves every required artifact.
+
+## 9.2 Dependency sharing
+
+Gradle handles dependency caching and deduplication.
+
+Kagemusha must not implement an artifact-level dependency database.
+
+Different dependency versions can coexist.
+
+Multiple repositories may contribute to the same cache.
+
+Gradle cache metadata compatibility must be tested for the Wrapper versions being used.
+
+## 9.3 Snapshot contents
+
+Publish:
+
+```text
+modules-2/
+```
+
+from:
+
+```text
+$GRADLE_USER_HOME/caches/modules-2
+```
+
+Exclude lock files and `gc.properties`, according to Gradle's documented cache-copy guidance.
+
+Create the snapshot only after all participating Gradle processes have exited.
+
+Do not publish project-local `.gradle` or `build` directories.
+
+## 9.4 Consumer
+
+The snapshot must support:
+
+```bash
+GRADLE_RO_DEP_CACHE=/opt/kagemusha/gradle
+```
+
+With:
+
+```text
+/opt/kagemusha/gradle/modules-2/
+```
+
+Consumer workspaces use an independent writable `GRADLE_USER_HOME`.
+
+If a dependency is missing, Gradle may download it into the consumer's writable cache.
+
+## 9.5 Wrapper distributions
+
+Gradle Wrapper distributions are a separate artifact group.
+
+Source:
+
+```text
+$GRADLE_USER_HOME/wrapper/dists/
+```
+
+They must not be placed into `GRADLE_RO_DEP_CACHE`.
+
+Provide restoration instructions for the E2B Template Builder.
+
+## 9.6 Validation
+
+For each supported project:
+
+1. Restore a published cache into a clean environment.
+2. Configure `GRADLE_RO_DEP_CACHE`.
+3. Use a fresh writable Gradle User Home.
+4. Execute configured verification tasks with `--offline`.
+5. Verify success and capture errors.
+
+A successful offline run proves the selected verification tasks are satisfied, not that every possible Gradle task is fully cached.
+
+Validation must use the project's Wrapper version.
+
+---
+
+# 10. pnpm Cache Provider
+
+## 10.1 Shared package store
+
+pnpm Seed Targets should reuse a common package store within a compatible cache group.
+
+Use an explicit store path when executing pnpm.
+
+Example:
+
+```bash
+mise exec -- pnpm fetch \
+  --store-dir /data/cache/work/pnpm
+```
+
+The implementation must discover the effective store structure rather than assuming all pnpm releases use the same layout.
+
+## 10.2 Compatibility
+
+Cache compatibility must consider:
+
+- pnpm store format.
+- pnpm version.
+- OS.
+- CPU architecture.
+- Relevant installation configuration.
+
+Do not assume pnpm major version alone fully determines compatibility.
+
+Allow multiple pnpm cache groups.
+
+## 10.3 Snapshot
+
+Snapshot the package store, not `node_modules`.
+
+Do not snapshot compiled application outputs.
+
+Use a separate artifact from Gradle.
+
+## 10.4 Consumer
+
+V1 should restore the pnpm store into a writable directory.
+
+Example:
+
+```bash
+pnpm install \
+  --offline \
+  --frozen-lockfile \
+  --store-dir /workspace/.cache/pnpm
+```
+
+Do not assume pnpm shares Gradle's read-only cache semantics.
+
+Native packages and install scripts may require additional work.
+
+## 10.5 Validation
+
+Use a clean temporary copy of the project's required manifests and files.
+
+Perform:
+
+```bash
+pnpm install --offline --frozen-lockfile
+```
+
+With the restored store.
+
+Validate pnpm workspaces as well as normal projects.
+
+Never modify the original lockfile during validation.
+
+---
+
+# 11. Incremental Seeding
+
+This is a first-class requirement.
+
+## 11.1 Dependency fingerprint
+
+Compute a fingerprint for each Seed Target.
+
+Gradle fingerprint inputs include:
+
+- Gradle settings and build scripts.
+- Version catalogs.
+- Wrapper configuration.
+- Dependency declaration files.
+- Relevant `buildSrc` and included-build configuration.
+- mise configuration.
+- Configured seed tasks.
+- Cache provider version and compatibility settings.
+
+pnpm fingerprint inputs include:
+
+- `pnpm-lock.yaml`.
+- `pnpm-workspace.yaml`.
+- Relevant package manifests.
+- Non-secret installation configuration.
+- Toolchain configuration.
+- Cache provider version and compatibility settings.
+
+Do not hash secrets into publicly exposed metadata.
+
+Calculate fingerprints using deterministic ordering.
+
+A Git commit change alone must not necessarily trigger reseeding.
+
+## 11.2 Incremental algorithm
+
+At the beginning of a Seed Job:
+
+1. Resolve all enabled Seed Targets.
+2. Fetch relevant Git revisions.
+3. Calculate current fingerprints.
+4. Identify the active published Snapshot for each cache group.
+5. Verify the snapshot and mutable working cache are valid.
+6. Compare fingerprints against the states represented by the active snapshot.
+7. Seed changed or missing targets.
+8. Reuse existing dependencies from the shared cache.
+9. Create candidate snapshots.
+10. Validate candidates.
+11. Publish new snapshots.
+12. Atomically update published states in SQLite.
+
+If nothing changed and the existing snapshot is valid, complete the job without generating a duplicate snapshot.
+
+## 11.3 Important invariant
+
+**A target must not be considered successfully seeded merely because its build command completed.**
+
+It becomes successfully seeded for publication purposes only when its required contents are represented by a successfully published, validated snapshot.
+
+## 11.4 Mutable cache recovery
+
+Incremental seeding relies on an existing mutable cache that is compatible with the current published state.
+
+If the mutable cache is missing or cannot be trusted:
+
+- Restore from the current published snapshot when supported.
+- Otherwise perform a full reseed.
+- Never treat missing local cache files as a cache hit based only on SQLite metadata.
+
+For Gradle, restore a snapshot into a separate writable Seeder cache area; do not mutate the published immutable artifact.
+
+## 11.5 Full rebuild
+
+Support:
+
+```json
+{
+  "mode": "full"
+}
+```
+
+A Full Rebuild:
+
+- Uses a fresh mutable cache directory.
+- Processes all enabled targets in the selected groups.
+- Creates candidate snapshots.
+- Validates them.
+- Replaces the stable snapshot pointer only after success.
+
+This is the primary cache compaction strategy.
+
+Do not implement an artifact-level garbage collector for Gradle or pnpm in V1.
+
+## 11.6 Dynamic dependencies
+
+Some Gradle dependencies use:
+
+- Dynamic versions.
+- SNAPSHOT versions.
+- Changing modules.
+- External configuration.
+
+Fingerprinting cannot detect every possible dependency change.
+
+Support:
+
+- Forced reseeding.
+- Periodic full rebuilds.
+- Optional dependency refresh policies.
+
+Document that a fingerprint match is not a universal proof that remote dependencies are unchanged.
+
+---
+
+# 12. Job System
+
+Use SQLite-backed durable jobs.
+
+Supported types:
+
+```text
+repository.fetch
+copy.create
+cache.seed
+cache.full_rebuild
+cache.verify
+cache.gc
+```
+
+## 12.1 State machine
+
+```text
+queued
+   |
+   v
+running
+   |
+   +---> succeeded
+   |
+   +---> failed
+   |
+   +---> cancelled
+```
+
+Store partial results at the target level.
+
+The overall Seed Job may also report `partial` if the system intentionally supports publishing validated results from a subset of targets.
+
+Do not silently publish incomplete groups.
+
+## 12.2 Worker claiming
+
+Use an atomic SQLite claim operation.
+
+Store:
+
+- Worker ID.
+- Attempt count.
+- Lease expiry.
+- Last progress timestamp, if needed.
+
+Use a lease or heartbeat policy appropriate for long-running commands.
+
+A Worker must not hold a database transaction while executing subprocesses.
+
+## 12.3 Crash recovery
+
+On Worker restart:
+
+- Detect expired jobs.
+- Inspect temporary artifacts.
+- Remove or quarantine incomplete staging directories.
+- Requeue safe idempotent work or fail jobs with an explicit reason.
+- Do not allow two Workers to mutate the same cache group simultaneously.
+
+V1 may enforce a single Worker instance and one active seed job.
+
+Still implement recovery in a way that does not permanently strand jobs.
+
+## 12.4 Process management
+
+Use asyncio subprocess APIs.
+
+Apply configurable:
+
+- Execution timeout.
+- CPU and memory limits.
+- Output size limits.
+- Graceful termination timeout.
+
+On cancellation:
+
+1. Send termination to the subprocess group.
+2. Allow a bounded grace period.
+3. Force termination if necessary.
+4. Reap child processes.
+5. Clean temporary resources.
+
+---
+
+# 13. Cache Snapshots
+
+## 13.1 Artifact groups
+
+At minimum:
+
+```text
+gradle-dependencies
+gradle-wrapper
+pnpm-store
+```
+
+Artifacts are immutable.
+
+Use `tar.zst`.
+
+Each snapshot includes a manifest and archive checksum.
+
+## 13.2 Snapshot identity
+
+Use a stable, content-derived identifier.
+
+Record:
+
+```text
+snapshot_id
+provider
+cache_group_id
+platform
+created_at
+tool_versions
+source_targets
+fingerprints
+archive_sha256
+archive_size
+validation_result
+```
+
+The manifest must be sufficient to explain where a snapshot came from, even without querying the database.
+
+## 13.3 Publication
+
+Publication sequence:
+
+1. Acquire cache group lock.
+2. Prepare candidate in a staging directory.
+3. Finish all seeding processes.
+4. Produce immutable archive.
+5. Compute checksum.
+6. Verify archive integrity.
+7. Perform offline validation.
+8. Place archive and manifest at their final immutable paths.
+9. Commit SQLite metadata and active snapshot pointer.
+10. Release lock.
+11. Clean unused staging artifacts.
+
+If any step fails, retain the previous active snapshot.
+
+If the process crashes after step 8 and before step 9, startup recovery must identify the orphaned artifact.
+
+## 13.4 Retention
+
+Initial policy:
+
+- Retain the active snapshot.
+- Retain the last three previously published snapshots per group.
+- Retain artifacts referenced by active operations.
+- Remove unreferenced expired artifacts during scheduled GC.
+
+Do not remove snapshots used by an E2B Template merely because they are no longer active.
+
+Support explicit pinning or retention of snapshots by immutable ID.
+
+---
+
+# 14. HTTP API
+
+All APIs should use consistent naming and status semantics.
+
+Use asynchronous jobs for expensive operations.
+
+## 14.1 Repositories
+
+```http
+PUT    /repositories/{id}
+GET    /repositories
+GET    /repositories/{id}
+DELETE /repositories/{id}
+
+POST   /repositories/{id}/fetch
+POST   /repositories/{id}/copies
+```
+
+## 14.2 Working Copies
+
+```http
+GET    /copies/{id}
+GET    /copies/{id}/download
+DELETE /copies/{id}
+```
+
+## 14.3 Seed Targets
+
+```http
+GET    /repositories/{id}/seed-targets
+PUT    /repositories/{id}/seed-targets/{target_id}
+DELETE /repositories/{id}/seed-targets/{target_id}
+```
+
+Automatic discovery:
+
+```http
+POST /repositories/{id}/seed-targets/discover
+```
+
+Discovery may run asynchronously if repository synchronization is required.
+
+## 14.4 Cache Jobs
+
+```http
+POST /cache-jobs
+GET  /cache-jobs
+GET  /cache-jobs/{id}
+POST /cache-jobs/{id}/cancel
+```
+
+Example request:
+
+```json
+{
+  "repository_ids": [
+    "api",
+    "web"
+  ],
+  "providers": [
+    "gradle",
+    "pnpm"
+  ],
+  "mode": "incremental"
+}
+```
+
+If `repository_ids` is omitted, use all enabled repositories authorized for the request.
+
+Supported modes:
+
+```text
+incremental
+full
+force
+```
+
+The exact distinction between `full` and `force` must be implemented consistently: `force` reruns selected targets while `full` builds a fresh shared cache from the selected complete target set.
+
+## 14.5 Cache Snapshots
+
+```http
+GET /cache-groups
+GET /cache-groups/{id}
+
+GET /cache-snapshots
+GET /cache-snapshots/{id}
+GET /cache-snapshots/{id}/download
+```
+
+Expose current active snapshot IDs in Cache Group metadata.
+
+Do not overload a global `stable` endpoint when multiple incompatible pnpm or Gradle cache groups exist.
+
+## 14.6 Administrative actions
+
+```http
+POST /cache-groups/{id}/verify
+POST /cache-groups/{id}/rebuild
+POST /maintenance/gc
+```
+
+Administrative endpoints must have explicit access control.
+
+## 14.7 API requirements
+
+- OpenAPI documentation.
+- Structured errors.
+- Request validation.
+- Authentication.
+- Correct HTTP status codes.
+- Paginated list operations.
+- Stable resource IDs.
+- Streaming downloads.
+- Idempotent resource creation where possible.
+
+Avoid exposing internal filesystem paths in public API responses.
+
+---
+
+# 15. Storage Layout
+
+Use a Docker named volume mounted at `/data`.
+
+Suggested structure:
 
 ```text
 /data/
-├── projects/
-│   ├── project-a.git/
-│   └── project-b.git/
-├── metadata/
-│   ├── project-a.json
-│   └── project-b.json
-├── locks/
-│   ├── project-a.lock
-│   └── project-b.lock
-└── tmp/
+├── kagemusha.db
+├── git/
+│   └── mirrors/
+├── copies/
+│   ├── staging/
+│   └── artifacts/
+├── cache/
+│   ├── work/
+│   │   ├── gradle/
+│   │   └── pnpm/
+│   ├── staging/
+│   └── snapshots/
+│       ├── gradle-dependencies/
+│       ├── gradle-wrapper/
+│       └── pnpm-store/
+├── mise/
+├── jobs/
+└── backups/
 ```
 
-所有持久化数据放入一个 Docker Named Volume。
+The SQLite database and WAL sidecars must remain on a real filesystem supporting SQLite locking.
 
-`tmp` 也可以放入该 Volume，避免大型归档占用容器可写层；临时文件需定期清理。
+Do not mount SQLite over NFS.
 
-Project 的缓存为 Bare Git Repository。
+All persistent paths must be configurable but default to `/data`.
 
-不要保留长期存在的普通 Git Working Directory。
+Snapshot storage should expose a small abstraction allowing S3-compatible storage in the future.
 
-## 4.3 Project 隔离
-
-一个 Project 必须绑定固定的 Git Repository 和授权安全域。
-
-第一版由可信 Orchestrator 保证：
-
-- Project ID 不能跨用户随意复用。
-- 当前请求方拥有访问该 Project 的权限。
-- 不同授权安全域不得共享可直接读取的 Bare Repo。
-
-Git Workspace Service 还必须保证不能通过本地缓存绕过远端 Ref 的访问权限。
-
-即使某个 Commit 已经存在于缓存中，也不能让调用方通过任意 SHA 读取它。
+Do not implement OSS/TOS in V1 unless the existing repository already contains a suitable storage abstraction.
 
 ---
 
-# 5. API
+# 16. Docker Deployment
 
-第一版只实现两个业务 API。
+Provide:
 
-另提供一个健康检查接口。
+- Dockerfile.
+- compose.yaml.
+- Health checks.
+- Persistent named volume.
+- Non-root execution.
+- Resource limits.
+- Graceful shutdown.
 
-## 5.1 初始化项目
-
-`POST /projects/{project_id}`
-
-Request:
-
-```json
-{
-  "repository": "https://gitlab.example.com/team/project.git",
-  "provider": "gitlab",
-  "credential": {
-    "type": "token",
-    "token": "glpat-xxxxx"
-  }
-}
-```
-
-### 参数
-
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| project_id | 是 | 控制端生成的 ID |
-| repository | 是 | HTTPS Git URL |
-| provider | 是 | github / gitlab |
-| credential.type | 是 | 固定为 token |
-| credential.token | 是 | 本次请求使用的 Token |
-
-`project_id` 限制为安全字符集：
+Recommended base image:
 
 ```text
-[a-zA-Z0-9_-]{1,128}
+Debian trixie-slim
 ```
 
-不允许通过 ID 构造任意文件系统路径。
+Use uv to install the Python application.
 
-### 执行流程
+Install only required system tools:
 
-1. 验证服务 API 身份。
-2. 验证 Project ID、Repository URL、Provider。
-3. 获取 Project Lock。
-4. 检查 Project 是否已存在。
-5. 在临时目录 Clone 远端仓库。
-6. 验证 Bare Repository 完整性。
-7. 识别远端默认分支。
-8. 清除所有可能包含凭证的配置。
-9. 将仓库原子移动到最终目录。
-10. 原子写入 Project 元数据。
-11. 释放 Lock。
-12. 清理临时凭证。
+- Git.
+- mise.
+- tar.
+- zstd.
+- CA certificates.
+- Required shell/runtime dependencies.
 
-建议使用：
+Use mise to install Java, Node.js and pnpm.
 
-```bash
-git clone --bare \
-  https://gitlab.example.com/team/project.git \
-  /data/tmp/clone-<uuid>
-```
+Do not preinstall every possible toolchain version into the image.
 
-使用带有 Token 的临时 ASKPASS 完成认证。
+Both API and Worker should run from the same application image.
 
-不得将 Token 拼入 URL。
-
-对于进程崩溃可能导致的仓库与元数据部分提交问题，启动时应进行一致性检查与恢复。
-
-### 成功响应
-
-HTTP 201：
-
-```json
-{
-  "project_id": "project-a",
-  "repository": "https://gitlab.example.com/team/project.git",
-  "provider": "gitlab",
-  "default_branch": "main"
-}
-```
-
-已经存在的 Project 返回 HTTP 409。
-
-不得覆盖已有仓库。
-
----
-
-## 5.2 创建 Working Copy
-
-`POST /projects/{project_id}/copies`
-
-Request:
-
-```json
-{
-  "ref": "mr:123",
-  "depth": 50,
-  "branch_prefix": "agent/task-123",
-  "credential": {
-    "type": "token",
-    "token": "glpat-xxxxx"
-  }
-}
-```
-
-### 参数
-
-| 字段 | 必填 | 默认值 | 说明 |
-|---|---|---|---|
-| ref | 是 | — | Branch、Tag、PR/MR |
-| depth | 否 | 50 | Git 历史深度 |
-| branch_prefix | 否 | — | 可选的本地工作分支前缀 |
-| credential.type | 是 | — | token |
-| credential.token | 是 | — | 本次 Fetch 的 Token |
-
-### Depth 规则
-
-| Depth | 行为 |
-|---|---|
-| 0 | 完整历史 |
-| 1 | 只获取目标 Commit |
-| 50 | 默认，最近 50 层历史 |
-| 100 | 更深历史 |
-| 1000 | 允许的最大有限深度 |
-
-有效值：
-
-```text
-0 或 1～1000
-```
-
-`depth=0` 表示完整历史，不应直接传给 Git 的 `--depth` 参数。
-
-必须使用严格的整数验证，不接受负数、浮点数或字符串形式的非法值。
-
-### 执行流程
-
-1. 验证 Project 存在。
-2. 验证 Ref 格式及 Provider 匹配。
-3. 验证请求授权。
-4. 获取项目 Fetch Lock。
-5. 使用本次请求的 Token Fetch 指定远端 Ref。
-6. 从本次 Fetch 结果解析 Commit SHA。
-7. 为 Commit 创建内部临时 Ref。
-8. 释放 Fetch Lock。
-9. 创建临时 Git Workspace。
-10. 按指定 Depth 从缓存仓库 Fetch。
-11. Checkout 固定 Commit，并按 Ref 类型或 `branch_prefix` 配置工作分支。
-12. 递归校验并初始化 HTTPS Submodule。
-13. 下载并校验主仓库及所有 Submodule 的 Git LFS 对象。
-14. 验证 Git 状态与对象独立性。
-15. 生成 tar.zst 归档。
-16. 返回归档。
-17. 删除内部临时 Ref 和临时 Workspace。
-
-内部临时 Ref 的创建与删除必须协调，防止并发 GC 回收正在使用的对象。
-
-### 成功响应
-
-HTTP 200：
-
-```http
-Content-Type: application/zstd
-Content-Disposition: attachment; filename="workspace.tar.zst"
-Content-Length: <archive-bytes>
-X-Git-Commit: <sha>
-X-Git-Ref: mr:123
-X-Git-Depth: 50
-X-Git-Branch: kagemusha/mr-123
-```
-
-响应主体为二进制归档。
-
-### 归档结构
-
-```text
-workspace/
-├── .git/
-│   ├── HEAD
-│   ├── config
-│   ├── objects/
-│   ├── refs/
-│   └── shallow          # depth > 0 时可能存在
-├── src/
-├── README.md
-├── build.gradle.kts
-└── ...
-```
-
-解压后的仓库必须能独立运行：
-
-```bash
-git status
-git log
-git diff
-git switch -c agent/task-123
-git commit
-```
-
-普通 Branch 默认检出同名 tracking branch；PR/MR 默认检出 `kagemusha/pr-*` 或 `kagemusha/mr-*`；Tag 默认允许 Detached HEAD。传入 `branch_prefix` 时，所有 Ref 都创建带该前缀且无虚假 upstream 的本地工作分支。
-
-Submodule 必须递归完成，Git LFS pointer 必须在返回前 hydration。任何必要对象下载失败时请求整体失败。
-
----
-
-# 6. Ref 解析规范
-
-## 6.1 支持的 Ref
-
-| 输入 | 类型 |
-|---|---|
-| main | Branch |
-| feature/login | Branch |
-| refs/heads/main | Branch |
-| refs/tags/v1.0.0 | Tag |
-| pr:123 | GitHub PR |
-| mr:123 | GitLab MR |
-
-## 6.2 GitHub
-
-```text
-pr:123
-    ↓
-refs/pull/123/head
-```
-
-## 6.3 GitLab
-
-```text
-mr:123
-    ↓
-refs/merge-requests/123/head
-```
-
-这里使用的是 PR/MR Source HEAD，而不是合并结果 Ref。
-
-## 6.4 普通分支
-
-```text
-main
-    ↓
-refs/heads/main
-```
-
-```text
-feature/login
-    ↓
-refs/heads/feature/login
-```
-
-## 6.5 Tag
-
-```text
-refs/tags/v1.0.0
-```
-
-如果短名称同时匹配 Branch 和 Tag，优先 Branch。
-
-需要指定 Tag 时使用完整 Ref。
-
-Annotated Tag 必须解析为对应的 Commit。
-
-## 6.6 安全限制
-
-必须验证 Ref 格式。
-
-禁止接受任意 Git Revision Expression，例如：
-
-```text
-HEAD~3
-main^{tree}
-abc123...
-```
-
-第一版不支持直接传入任意 Commit SHA。
-
-原因是缓存仓库可能持有当前调用方无权访问的历史对象。
-
-必须在本次请求中成功从远端 Fetch 指定 Ref，才能创建对应 Working Copy。
-
-不要通过已有的本地 Ref 静默回退。
-
----
-
-# 7. Git Fetch 与缓存管理
-
-## 7.1 Bare Repo
-
-Bare Repo 保持完整历史。
-
-不要对共享 Bare Repo 使用 Shallow Clone。
-
-初始化项目后，后续 Fetch 仅更新指定 Ref。
-
-对于任意普通分支：
-
-```bash
-git --git-dir=/data/projects/project-a.git \
-  fetch --no-tags origin \
-  refs/heads/main
-```
-
-对特殊 PR/MR 使用对应的完整 RefSpec。
-
-实际实现必须确保本次 Fetch 得到的目标 Commit 被可靠保存，不能在 Fetch 后重新读取一个可能已被并发请求更新的共享 Ref 来判断 Commit。
-
-可以采用请求唯一的内部 Ref：
-
-```text
-refs/kagemusha/snapshots/<request-uuid>
-```
-
-每次请求的固定 Commit 生命周期需要覆盖整个 Workspace 生成过程。
-
-## 7.2 Fetch Lock
-
-同一 Project 的 Fetch 串行化。
-
-不同 Project 的 Fetch 可以并发。
-
-采用 Linux flock。
-
-不要只依赖：
-
-```python
-asyncio.Lock()
-```
-
-因为它无法在多个 Worker 或进程间协调。
-
-第一版 Uvicorn 使用单 Worker，但文件锁仍然必须实现。
-
-## 7.3 Git GC
-
-第一版禁止自动执行破坏性 Git GC。
-
-设置：
-
-```text
-gc.auto=0
-maintenance.auto=false
-```
-
-不实现后台 Prune。
-
-Git 缓存可能持续增长，这是第一版明确接受的取舍。
-
-后续如果引入仓库清理，需要确保不会回收正在生成 Workspace 所需的对象。
-
----
-
-# 8. Shallow Workspace 实现
-
-这是本项目需要重点正确实现的部分。
-
-## 8.1 原则
-
-控制端：
-
-```text
-Bare Repo
-完整历史
-```
-
-Workspace：
-
-```text
-Shallow Repo
-默认 depth=50
-```
-
-两者必须独立。
-
-不要将 Bare Repo 自己变成 Shallow Repository。
-
-## 8.2 固定 Commit
-
-远端 Fetch 成功后，例如得到：
-
-```text
-Commit = abcdef123456...
-```
-
-服务在 Bare Repo 中为这次请求创建：
-
-```text
-refs/kagemusha/snapshots/<uuid>
-```
-
-该 Ref 指向本次 Fetch 的 Commit。
-
-这一步的作用：
-
-- 避免多个请求共享同一个 FETCH_HEAD。
-- 防止远端分支移动影响本次 Workspace。
-- 保证本地 Fetch 可以访问明确的 Ref。
-- 为 Git Object 生命周期提供保护。
-
-## 8.3 创建 Workspace
-
-先初始化独立 Git 仓库：
-
-```bash
-git init /data/tmp/workspace-<uuid>
-```
-
-对于默认 `depth=50`：
-
-```bash
-git -C /data/tmp/workspace-<uuid> \
-  fetch --no-tags --depth=50 \
-  file:///data/projects/project-a.git \
-  refs/kagemusha/snapshots/<uuid>
-```
-
-然后根据 Ref 类型和 `branch_prefix` 检出固定 Commit。例如普通 Branch：
-
-```bash
-git -C /data/tmp/workspace-<uuid> \
-  checkout -B main <commit>
-```
-
-实际实现中应固定并核对完整 Commit SHA，不能在多个 Git 命令之间依赖未经保护的共享状态。
-
-对于 `depth=0`：
-
-```bash
-git -C /data/tmp/workspace-<uuid> \
-  fetch --no-tags \
-  file:///data/projects/project-a.git \
-  refs/kagemusha/snapshots/<uuid>
-```
-
-然后 Checkout。
-
-这种做法不需要依赖 `git clone --branch`，因此也适用于 MR/PR 的特殊 Ref。
-
-## 8.4 Why file://
-
-本地 Git 仓库直接 Clone 时，Git 可能启用本地文件复制优化。
-
-通过 `file://` 使用正常 Git 传输机制，才能可靠地应用 Depth 限制。
-
-不得使用：
-
-```bash
-git clone --shared
-```
-
-也不得使用 alternates 引用源仓库对象。
-
-## 8.5 验证
-
-必须验证：
-
-```bash
-git rev-parse HEAD
-```
-
-与目标 Commit 完全一致。
-
-对于 `depth > 0`，验证：
-
-```bash
-git rev-parse --is-shallow-repository
-```
-
-注意：如果目标 Commit 的完整历史本身不足指定深度，Git 可以返回非 Shallow Repository。这是正常情况，不应报错。
-
-对于 `depth=0`，必须保证完整历史。
-
-同时检查：
-
-```text
-.git/objects/info/alternates
-```
-
-不得引用服务端对象路径。
-
-## 8.6 Git 历史的局限性
-
-默认 Depth=50 不保证包含与目标分支的 Merge Base。
-
-因此：
-
-```bash
-git merge-base HEAD main
-```
-
-可能失败，尤其当 Workspace 未获取 main 分支，或者共同祖先超出 Shallow History 时。
-
-这是可接受的第一版限制。
-
-本期不要求提供多个完整 Branch 的历史。
-
-Agent 如需完整历史，应请求：
-
-```json
-{
-  "ref": "mr:123",
-  "depth": 0
-}
-```
-
----
-
-# 9. Workspace 压缩格式
-
-## 9.1 默认格式
-
-使用：
-
-```text
-tar.zst
-```
-
-算法：
-
-```text
-Zstandard
-```
-
-默认参数：
-
-```text
-Compression Level = 3
-Threads = 1
-```
-
-## 9.2 打包命令
-
-使用 GNU tar + zstd：
-
-```bash
-tar \
-  -C /data/tmp \
-  -I 'zstd -T1 -3' \
-  -cf /data/tmp/workspace-<uuid>.tar.zst \
-  workspace-<uuid>
-```
-
-实际生成归档时应统一顶层目录名称为：
-
-```text
-workspace/
-```
-
-而不是暴露服务内部 UUID。
-
-归档应包含：
-
-- 工作目录全部文件
-- `.git`
-- 文件权限
-- 可执行位
-- 符号链接
-
-不得将凭证相关文件打入归档。
-
-## 9.3 解压方式
-
-E2B 内使用：
-
-```bash
-mkdir -p /workspace/project
-
-tar --zstd \
-  -xf workspace.tar.zst \
-  -C /workspace/project \
-  --strip-components=1
-```
-
-E2B Template 必须包含：
-
-```text
-git
-tar
-zstd
-```
-
-## 9.4 压缩限制
-
-默认最大归档大小：
-
-```text
-1 GiB
-```
-
-超过限制返回 HTTP 413。
-
-不得为此将完整归档读取到 Python 内存。
-
-优先生成临时归档文件，再使用 FileResponse 返回。
-
-应避免不受限制的磁盘占用，允许配置临时空间预算。
-
-第一版不需要支持 gzip、xz、zip 或压缩格式协商。
-
----
-
-# 10. Git Token 认证
-
-## 10.1 基本原则
-
-用户 Git Token 由 Orchestrator 每次请求时提供。
-
-Git Workspace Service 不持久化 Token。
-
-不执行：
-
-```bash
-gh auth login
-glab auth login
-```
-
-不依赖用户本地 Git 配置。
-
-## 10.2 HTTPS 认证
-
-GitHub：
-
-```text
-Username = x-access-token
-Password = <token>
-```
-
-GitLab：
-
-```text
-Username = oauth2
-Password = <token>
-```
-
-使用 `GIT_ASKPASS` 提供认证。
-
-## 10.3 ASKPASS
-
-实现一个固定的 ASKPASS 程序。
-
-ASKPASS 脚本中不得包含硬编码 Token。
-
-Python 根据请求设置临时执行环境：
-
-```text
-GIT_ASKPASS=/app/git-askpass
-GIT_TERMINAL_PROMPT=0
-GIT_USERNAME=...
-GIT_TOKEN=...
-```
-
-使用：
-
-```python
-asyncio.create_subprocess_exec(...)
-```
-
-不得使用：
-
-```python
-shell=True
-```
-
-不得把用户输入拼成 Shell Command。
-
-清空不可信的继承 Git 配置及 Credential Helper。
-
-Git Token 不得：
-
-- 拼进 Git URL。
-- 出现在子进程命令行。
-- 出现在 `.git/config`。
-- 进入归档。
-- 进入访问日志。
-- 进入异常响应。
-- 被其他请求共享。
-
-Token 通过子进程环境传递时仍存在本机进程读取风险，因此整个 Git Service 必须被视为受信任执行环境。
-
-## 10.4 URL 安全
-
-Repository URL 必须：
-
-- 使用 HTTPS。
-- 不包含 URL Userinfo。
-- 与 Provider 配置一致。
-- Host 在受信任 Allowlist 中。
-- 禁止不可信 HTTP 重定向。
-- 禁止通过 Git URL Rewrite 变更目标 Host。
-- 禁止访问云元数据和未授权内网地址。
-
-需要支持企业自建 GitHub/GitLab Host，由服务配置允许的域名列表。
-
-不要通过禁用 TLS 验证来处理企业证书问题。
-
-可通过受信任 CA Bundle 添加企业内部 CA。
-
-## 10.5 Git Protocol 安全
-
-只允许预期的 HTTPS Git 访问和内部本地 `file://` Fetch。
-
-内部 `file://` 的路径必须由服务端根据 Project ID 构造，而不是由用户直接提供。
-
-禁用非预期的外部协议与 Git Ext Transport。
-
-不要运行任何用户仓库中的代码、Hook 或安装脚本。
-
-建议隔离 HOME、XDG_CONFIG_HOME、Git 系统/全局配置及 Git Template 目录。
-
----
-
-# 11. 服务自身认证
-
-Git Token 与 Git Workspace Service API Token 是两个不同的概念。
-
-服务间认证：
-
-```http
-Authorization: Bearer <KAGEMUSHA_API_TOKEN>
-```
-
-使用环境变量：
-
-```text
-KAGEMUSHA_API_TOKEN
-```
-
-所有业务 API 必须验证该 Token。
-
-`/healthz` 可以不要求认证，但只应提供不含敏感信息的健康状态。
-
-默认监听：
-
-```text
-127.0.0.1:8000
-```
-
-由 Orchestrator 通过本机或安全私有网络访问。
-
-如果跨主机部署，必须通过 TLS 或受保护的反向代理访问。
-
----
-
-# 12. 并发控制
-
-## 12.1 规模
-
-预期：
-
-```text
-20 concurrent Sandboxes
-```
-
-不意味着每秒有 20 个 Copy 请求。
-
-设计目标是支持多个任务同时请求 Workspace，而不是构建高吞吐 Git Hosting Service。
-
-## 12.2 并发限制
-
-默认：
-
-```text
-KAGEMUSHA_MAX_CONCURRENT_GIT=4
-```
-
-限制重量级 Git/Archive 操作的并发数量。
-
-每个 Project 使用独立 Fetch Lock。
-
-归档生成可以并行，但必须保证对象不会在生成过程中被回收。
-
-## 12.3 进程取消
-
-所有 Git 和 tar 子进程应：
-
-- 有超时。
-- 可以取消。
-- 取消时终止子进程组。
-- 避免僵尸进程。
-- 在 finally 中释放资源。
-
-客户端中断下载时仍需清理归档。
-
-## 12.4 临时目录
-
-所有操作使用唯一 UUID 临时目录。
-
-启动时清理超过配置 TTL 的临时资源。
-
-不得清理仍在被活跃请求使用的目录。
-
-对于重启后残留的临时 Ref，也应提供安全的清理机制。
-
-## 12.5 无分布式依赖
-
-第一版只运行一个服务实例。
-
-Uvicorn：
-
-```text
-workers=1
-```
-
-Docker Compose：
-
-```text
-replicas=1
-```
-
-未来如果部署多个实例，需要重新设计共享磁盘与并发协调，不能仅依赖单主机 flock。
-
----
-
-# 13. 错误处理
-
-统一错误格式：
-
-```json
-{
-  "error": {
-    "code": "REF_NOT_FOUND",
-    "message": "Requested Git ref was not found"
-  }
-}
-```
-
-## 13.1 错误码
-
-| Error | HTTP |
-|---|---|
-| INVALID_REQUEST | 400 |
-| INVALID_REF | 400 |
-| UNAUTHORIZED | 401 |
-| GIT_AUTH_FAILED | 401 |
-| GIT_ACCESS_DENIED | 403 |
-| PROJECT_NOT_FOUND | 404 |
-| REF_NOT_FOUND | 404 |
-| PROJECT_ALREADY_EXISTS | 409 |
-| ARCHIVE_TOO_LARGE | 413 |
-| GIT_REMOTE_ERROR | 502 |
-| GIT_TIMEOUT | 504 |
-| INSUFFICIENT_STORAGE | 507 |
-| INTERNAL_ERROR | 500 |
-
-不要直接把未过滤的 Git stderr 返回客户端。
-
-服务日志可以记录经过脱敏处理的 Git 错误类别。
-
-错误信息不得包含 Token。
-
----
-
-# 14. 配置
-
-通过环境变量配置。
-
-```text
-KAGEMUSHA_DATA_DIR=/data
-KAGEMUSHA_API_TOKEN=<service-secret>
-
-KAGEMUSHA_MAX_CONCURRENT_GIT=4
-KAGEMUSHA_GIT_TIMEOUT_SECONDS=300
-
-KAGEMUSHA_DEFAULT_DEPTH=50
-KAGEMUSHA_MAX_DEPTH=1000
-
-KAGEMUSHA_ZSTD_LEVEL=3
-KAGEMUSHA_ZSTD_THREADS=1
-
-KAGEMUSHA_MAX_ARCHIVE_BYTES=1073741824
-KAGEMUSHA_TEMP_TTL_SECONDS=3600
-KAGEMUSHA_MAX_SUBMODULES=100
-KAGEMUSHA_MAX_SUBMODULE_DEPTH=10
-
-KAGEMUSHA_ALLOWED_GIT_HOSTS=github.com,gitlab.com
-```
-
-Host Allowlist 可以增加企业 GitLab 域名。
-
-不允许将 `KAGEMUSHA_ALLOWED_GIT_HOSTS` 配置为空并解释为允许所有 Host。
-
-配置启动时严格验证，错误时应 Fail Fast。
-
----
-
-# 15. Dockerfile
-
-## 15.1 镜像选择
-
-使用多阶段构建。
-
-Builder：
-
-```text
-ghcr.io/astral-sh/uv:python3.13-trixie-slim
-```
-
-Runtime：
-
-```text
-python:3.13-slim-trixie
-```
-
-Runtime 不需要保留 uv。
-
-暂时不使用 Alpine。
-
-要求构建依赖、运行依赖和 Python 环境一致。
-
-## 15.2 Dockerfile
-
-```dockerfile
-FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS builder
-
-WORKDIR /app
-
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/app/.venv
-
-COPY pyproject.toml uv.lock ./
-
-RUN uv sync \
-    --locked \
-    --no-dev \
-    --no-install-project
-
-
-FROM python:3.13-slim-trixie
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       git \
-       git-lfs \
-       tar \
-       zstd \
-       ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /app/.venv /app/.venv
-COPY src/ /app/src/
-
-ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONPATH="/app/src" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    KAGEMUSHA_DATA_DIR=/data
-
-RUN groupadd --system app \
-    && useradd --system --gid app app \
-    && mkdir -p \
-       /data/projects \
-       /data/metadata \
-       /data/locks \
-       /data/tmp \
-    && chown -R app:app /app /data
-
-USER app
-
-EXPOSE 8000
-
-CMD ["uvicorn", "kagemusha.app:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--workers", "1"]
-```
-
-此 Dockerfile 假定 Python 项目采用 `src` Layout，且运行依赖都在 `pyproject.toml` 中声明。
-
-Agent 应确保依赖安装与实际项目布局一致。
-
-必须提交 `uv.lock`。
-
-## 15.3 .dockerignore
-
-```text
-.git
-.venv
-__pycache__
-.pytest_cache
-.mypy_cache
-.ruff_cache
-.env
-.env.*
-*.pyc
-```
-
-生产部署时建议固定基础镜像 Digest。
-
----
-
-# 16. Docker Compose
-
-## 16.1 要求
-
-- 使用 Docker Named Volume。
-- 不使用 Host Bind Mount。
-- 单实例。
-- 容器自动重启。
-- 默认只暴露本机端口。
-- 支持健康检查。
-- `docker compose up -d --build` 可以直接运行。
-- 容器重建不丢失 Git 缓存。
-
-## 16.2 compose.yaml
+Example:
 
 ```yaml
 services:
-  git-workspace:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
-    image: git-workspace:local
-
+  api:
+    build: .
+    command: ["kagemushaa", "serve"]
+    volumes:
+      - kagemushaa-data:/data
     restart: unless-stopped
 
-    init: true
-
-    ports:
-      - "127.0.0.1:8000:8000"
-
-    environment:
-      KAGEMUSHA_DATA_DIR: /data
-      KAGEMUSHA_API_TOKEN: ${KAGEMUSHA_API_TOKEN:?required}
-
-      KAGEMUSHA_MAX_CONCURRENT_GIT: "4"
-      KAGEMUSHA_GIT_TIMEOUT_SECONDS: "300"
-
-      KAGEMUSHA_DEFAULT_DEPTH: "50"
-      KAGEMUSHA_MAX_DEPTH: "1000"
-
-      KAGEMUSHA_ZSTD_LEVEL: "3"
-      KAGEMUSHA_ZSTD_THREADS: "1"
-
-      KAGEMUSHA_MAX_ARCHIVE_BYTES: "1073741824"
-      KAGEMUSHA_TEMP_TTL_SECONDS: "3600"
-      KAGEMUSHA_MAX_SUBMODULES: "100"
-      KAGEMUSHA_MAX_SUBMODULE_DEPTH: "10"
-
-      KAGEMUSHA_ALLOWED_GIT_HOSTS: ${KAGEMUSHA_ALLOWED_GIT_HOSTS:-github.com,gitlab.com}
-
+  worker:
+    build: .
+    command: ["kagemushaa", "worker"]
     volumes:
-      - git-workspace-data:/data
-
-    stop_grace_period: 30s
-
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - kagemushaa-data:/data
+    restart: unless-stopped
 
 volumes:
-  git-workspace-data:
+  kagemushaa-data:
 ```
 
-## 16.3 持久化行为
+Provide an operational deployment configuration with health checks, environment variables and resource limits.
 
-```bash
-docker compose down
-docker compose up -d
-```
-
-数据必须保留。
-
-```bash
-docker compose down -v
-```
-
-会删除 Named Volume。
-
-README 必须明确提示这个行为。
-
-容器以非 Root 用户运行，需确保 Named Volume 首次初始化及再次挂载后均具有正确权限。
+No local bind mounts should be required.
 
 ---
 
-# 17. 日志
+# 17. Security
 
-使用结构化 JSON 日志。
+## 17.1 Trust boundary
 
-每个请求至少记录：
+Repositories are executable code.
+
+A Gradle build, pnpm lifecycle script, mise hook or project-specific configuration can execute arbitrary commands.
+
+Consequently, seeding must never run with Kagemusha API administration privileges.
+
+## 17.2 Isolation
+
+At minimum:
+
+- Worker runs as non-root.
+- No Docker socket mount.
+- No privileged container.
+- No host filesystem mount.
+- Separate CPU/memory limits.
+- Strict subprocess timeouts.
+- Controlled Git credentials.
+- Restricted filesystem access.
+- No API signing key or administration tokens passed into builds.
+
+V1 may explicitly support only trusted, administrator-registered repositories.
+
+For untrusted repositories, require a stronger isolated execution backend before enabling automatic seeding.
+
+A Python subprocess alone is not a security sandbox.
+
+## 17.3 Credentials
+
+Use references to stored/injected credentials.
+
+Never include credentials in:
+
+- Cache snapshots.
+- Working Copy artifacts.
+- Job metadata.
+- Logs.
+- API responses.
+- Published manifests.
+
+Do not automatically copy user `.npmrc`, `.netrc`, Gradle properties, or mise environment files into cache snapshots.
+
+## 17.4 Archive safety
+
+Prevent:
+
+- Path traversal.
+- Malicious symlinks.
+- Extraction outside destination.
+- Unbounded decompression.
+- Overwriting unrelated files.
+
+Verify checksums before extraction.
+
+---
+
+# 18. Operational Reliability
+
+## 18.1 Backups
+
+Use SQLite Online Backup API.
+
+Provide:
+
+```bash
+kagemusha db backup
+```
+
+Backups must include consistent database state.
+
+Snapshot artifacts require an independent backup/retention policy.
+
+Do not assume SQLite backup alone can restore dependency archives.
+
+## 18.2 Health checks
+
+Provide:
+
+```http
+GET /health/live
+GET /health/ready
+```
+
+Readiness should verify necessary local dependencies, including database access.
+
+Worker health must be observable independently from API health.
+
+## 18.3 Logging
+
+Use structured logs.
+
+Include:
 
 ```text
 request_id
-project_id
-operation
-provider
-ref
-resolved_commit
-depth
-fetch_duration_ms
-workspace_duration_ms
-archive_duration_ms
-archive_size_bytes
-total_duration_ms
-result
-error_code
+job_id
+repository_id
+seed_target_id
+cache_group_id
+snapshot_id
+duration
+status
+error
 ```
 
-禁止记录：
+Never log full credentials or sensitive environment variables.
 
-- Git Token
-- Authorization Header
-- 完整请求体
-- 含凭证的 URL
-- ASKPASS 环境变量
+## 18.4 Metrics
 
-第一版不需要 Prometheus。
+V1 may use logs and database queries.
 
-为后续 Prometheus Metrics 预留清晰的操作计时边界即可。
+Do not require a Prometheus server.
+
+Design for future metrics without coupling the application to an observability vendor.
 
 ---
 
-# 18. 测试
+# 19. Testing and Acceptance
 
-使用 pytest。
+## 19.1 Git
 
-需要提供可重复执行的自动化测试。
+Verify:
 
-## 18.1 Git 测试
+- Repository registration.
+- Idempotent updates.
+- Credential use.
+- Mirror fetch.
+- Concurrent fetch safety.
+- Working Copy archive creation.
+- Restored Git-mode copy can operate as intended.
+- TTL cleanup.
 
-- 初始化 Bare Repository。
-- 普通 Branch Fetch。
-- 带 `/` 的 Branch。
-- Tag Fetch。
-- Annotated Tag。
-- GitHub PR Ref 映射。
-- GitLab MR Ref 映射。
-- 远端 Branch 更新后重新 Fetch。
-- 删除远端 Branch 后请求失败，不回退旧缓存。
-- 请求不存在的 Ref。
+## 19.2 SQLite
 
-## 18.2 Depth 测试
+Verify:
 
-建立一个包含至少 120 个 Commit 的测试仓库。
+- Schema migrations.
+- Referential integrity.
+- Concurrent API/Worker access.
+- Atomic job claiming.
+- Job recovery after restart.
+- Recovery from interrupted snapshot publication.
 
-验证：
+## 19.3 Gradle
 
-- depth=1
-- depth=10
-- depth=50
-- depth=100
-- depth=0
-- depth=-1 被拒绝
-- depth=1001 被拒绝
+Use at least two real test projects with overlapping dependencies.
 
-要求：
+Verify:
 
-- Shallow Workspace HEAD 与目标 SHA 一致。
-- depth=50 不会意外带入完整历史。
-- depth=0 包含完整目标 Commit 历史。
-- 完整历史少于 depth 时能正常处理。
-- 使用 PR/MR Ref 时可以生成 Shallow Workspace。
-- Branch、PR/MR、Tag 及自定义 Branch Prefix 的 HEAD 状态正确。
-- HTTPS Submodule 递归初始化且固定在 gitlink Commit。
-- 需要认证的 Git LFS 对象在归档前完整下载。
+- Shared dependency downloads.
+- Multiple Wrapper versions.
+- Different dependency versions.
+- Cache snapshot generation.
+- Cache read-only compatibility.
+- Offline task execution.
+- No mutation of published cache.
 
-## 18.3 Workspace 独立性
+## 19.4 pnpm
 
-生成归档后：
+Use at least two projects with overlapping packages.
 
-1. 删除临时 Workspace。
-2. 将归档复制到另一个目录或容器。
-3. 解压。
-4. 验证 Git Status。
-5. 验证 Git Log。
-6. 验证 Git Diff。
-7. 验证 Git Commit。
-8. 验证 Object 完整性。
-9. 验证不存在外部 alternates。
-10. 验证不包含服务端绝对路径。
+Verify:
 
-同时验证目标仓库删除或不可访问后，已经生成的 Workspace 仍然可以正常使用。
+- Shared package store.
+- Lockfile-based fetch.
+- pnpm workspace handling.
+- Store snapshot restoration.
+- Offline installation.
+- Compatibility separation.
 
-## 18.4 并发
+## 19.5 Incremental seeding
 
-- 同一个 Project 并发 Fetch。
-- 同一个 Project 并发 Copy。
-- 不同 Project 并发 Copy。
-- Fetch 过程中取消请求。
-- Archive 过程中取消请求。
-- 下载中途断开。
-- Git Timeout。
-- tar/zstd 异常退出。
+Test:
 
-验证没有死锁、损坏仓库或遗留僵尸进程。
+1. Initial full seed.
+2. Second run without changes.
+3. Change only one target's dependencies.
+4. Verify only changed targets are reseeded.
+5. Publish the new shared snapshot.
+6. Restore it in a clean environment.
+7. Verify unchanged targets still work.
+8. Delete mutable working cache.
+9. Verify correct recovery/rebuild.
+10. Trigger a failed seed and confirm old stable snapshot remains usable.
 
-## 18.5 凭证安全
+## 19.6 End-to-end acceptance
 
-- Token 不会写入 `.git/config`。
-- Token 不会写入归档。
-- Token 不会被日志输出。
-- 不同并发请求使用不同 Token 不会串用。
-- Invalid Token 被正确拒绝。
-- Host Allowlist 生效。
-- HTTP URL 被拒绝。
-- 带 Userinfo 的 URL 被拒绝。
-- 禁止非授权访问内部 Git Object。
-
-## 18.6 Docker
-
-通过 Compose 运行集成测试：
-
-```bash
-docker compose up -d --build
-```
-
-验证：
-
-- Healthcheck 成功。
-- Named Volume 正常。
-- 初始化仓库。
-- 创建归档。
-- 重启容器。
-- 缓存仍然存在。
-- 非 Root 用户可以写入数据目录。
-- tar、zstd、git 均可用。
-
----
-
-# 19. 项目结构
+The following workflow must work:
 
 ```text
-git-workspace/
-├── Dockerfile
-├── compose.yaml
-├── .dockerignore
-├── .env.example
-├── pyproject.toml
-├── uv.lock
-├── README.md
-│
-├── src/
-│   └── kagemusha/
-│       ├── __init__.py
-│       ├── app.py
-│       ├── config.py
-│       ├── models.py
-│       ├── errors.py
-│       ├── auth.py
-│       ├── git.py
-│       ├── refs.py
-│       ├── repository.py
-│       ├── workspace.py
-│       ├── archive.py
-│       └── locks.py
-│
-└── tests/
-    ├── conftest.py
-    ├── test_projects.py
-    ├── test_refs.py
-    ├── test_depth.py
-    ├── test_workspace.py
-    ├── test_credentials.py
-    ├── test_concurrency.py
-    └── test_api.py
+Register Repository A
+Register Repository B
+      |
+      v
+Fetch repositories
+      |
+      v
+Discover Gradle/pnpm targets
+      |
+      v
+Run full cache seed
+      |
+      v
+Publish immutable snapshots
+      |
+      v
+Modify dependency in A
+      |
+      v
+Run incremental seed
+      |
+      v
+Only changed targets execute
+      |
+      v
+New validated snapshots published
+      |
+      v
+Clean consumer restores caches
+      |
+      v
+Gradle/pnpm offline verification succeeds
 ```
-
-可以适度合并文件。
-
-不要为了目录结构引入不必要的抽象层。
 
 ---
 
-# 20. README 要求
+# 20. Implementation Plan
 
-README 至少包含：
+Implement in five stages.
 
-1. 项目介绍。
-2. 技术栈。
-3. 启动方式。
-4. 配置参数说明。
-5. Git Token 权限要求。
-6. GitHub/GitLab 支持情况。
-7. Project 初始化 curl 示例。
-8. Workspace 下载 curl 示例。
-9. Depth 参数说明。
-10. E2B 解压示例。
-11. Docker Volume 持久化说明。
-12. 测试运行方式。
-13. 已知限制。
-14. 凭证安全注意事项。
+## Stage 1 — Repository and persistence foundation
 
-示例：
+- Refactor `projects` to `repositories`.
+- Normalize repository and Working Copy APIs.
+- Introduce SQLite migrations.
+- Implement durable jobs.
+- Split API and Worker entrypoints.
+- Keep Git operations functional.
 
-```bash
-docker compose up -d --build
-```
+**Milestone:** Kagemusha remains a fully working Git Working Copy service with durable state.
 
-初始化：
+## Stage 2 — Gradle seeding
 
-```bash
-curl -X POST \
-  http://127.0.0.1:8000/projects/my-project \
-  -H "Authorization: Bearer $KAGEMUSHA_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data-binary @init-project.json
-```
+- Add mise integration.
+- Add Seed Target discovery.
+- Implement Gradle provider.
+- Introduce shared mutable cache.
+- Implement snapshot creation.
+- Implement offline verification.
+- Introduce Cache Group and Snapshot models.
 
-创建 Workspace：
+**Milestone:** Multiple Gradle projects share a reusable cache snapshot.
 
-```bash
-curl -X POST \
-  http://127.0.0.1:8000/projects/my-project/copies \
-  -H "Authorization: Bearer $KAGEMUSHA_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data-binary @create-copy.json \
-  -o workspace.tar.zst
-```
+## Stage 3 — pnpm
 
-JSON 文件只作为 curl 输入示例，不应长期持久化真实 Token；建议使用临时文件并设置严格权限。
+- Implement pnpm provider.
+- Implement compatibility grouping.
+- Support pnpm workspaces.
+- Support package store snapshots.
+- Implement offline validation.
 
----
+**Milestone:** Gradle and pnpm both work through the same Cache Manager.
 
-# 21. 非目标
+## Stage 4 — Incremental and resilience
 
-第一版明确不实现：
+- Add dependency fingerprints.
+- Implement incremental seeding.
+- Implement full rebuild.
+- Add job recovery.
+- Add publication recovery.
+- Add snapshot retention.
+- Add Worker cancellation and timeouts.
 
-- Web UI
-- Git Token 持久化
-- SSH Private Key
-- Push
-- PR/MR 创建
-- Git Provider API Client
-- gh/glab 集成
-- E2B SDK
-- 跨节点 Git 缓存
-- 多实例服务
-- 分布式锁
-- 自动缓存 GC
-- 对象存储
-- 持久化 Task 状态
-- Workspace 长期存储
-- 多 Ref 工作区（如同时提供 main 和 MR 分支）
+**Milestone:** Incremental cache updates are safe across failures and restarts.
 
-这些能力将来可以独立增加。
+## Stage 5 — Operations and documentation
+
+- Complete Docker Compose deployment.
+- Add SQLite backup.
+- Add health checks.
+- Add API documentation.
+- Add E2B consumer examples.
+- Add integration tests.
+- Document maintenance and disaster recovery.
+
+**Milestone:** Single-command deployment and reliable end-to-end operations.
 
 ---
 
-# 22. 验收标准
+# 21. Explicit Non-goals for V1
 
-完成开发后，必须可以直接：
+Do not implement:
 
-```bash
-docker compose up -d --build
-```
+- PostgreSQL.
+- Redis.
+- Celery.
+- Kubernetes.
+- Distributed Cache Workers.
+- E2B SDK integration.
+- Git hosting provider management UI.
+- Remote Gradle Build Cache.
+- Maven/npm registry proxies.
+- Global deduplication across unrelated cache formats.
+- Custom dependency resolution engines.
+- Complex cache eviction based on individual packages.
+- Automatic seeding on every Working Copy creation.
+- CI/CD pipelines.
+- Agent execution or orchestration.
 
-并满足：
-
-- [ ] 服务正常启动，Healthcheck 通过。
-- [ ] 使用 Token 初始化私有 Git 仓库。
-- [ ] Project 缓存持久化到 Docker Named Volume。
-- [ ] 每次 Copy 必须 Fetch 指定 Ref。
-- [ ] 支持 GitHub PR。
-- [ ] 支持 GitLab MR。
-- [ ] 支持普通 Branch 与 Tag。
-- [ ] 支持默认 depth=50。
-- [ ] 支持 depth=0 完整历史。
-- [ ] 不修改 Bare Repo 的完整历史属性。
-- [ ] 归档使用 tar.zst。
-- [ ] zstd 默认 Level 3、单线程。
-- [ ] 归档包含独立、可运行的 Git 仓库。
-- [ ] 归档中不存在凭证。
-- [ ] 支持并发 Workspace 创建。
-- [ ] 子进程异常和请求取消后正确清理。
-- [ ] 错误响应清晰且没有敏感信息泄露。
-- [ ] 容器重建后项目缓存保留。
-- [ ] 自动化测试通过。
-- [ ] README 包含完整部署和 API 示例。
+Do not build abstractions for hypothetical requirements unless they directly simplify the current implementation.
 
 ---
 
-# 23. 实施顺序
+# 22. Instructions to the Coding Agent
 
-建议按照以下顺序实现。
+This document defines the target architecture.
 
-**Phase 1 — Project & Git**
+Before implementing:
 
-完成：
+1. Inspect the entire existing Kagemusha repository.
+2. Identify reusable code.
+3. Identify conflicting models/APIs.
+4. Create a concise implementation plan.
+5. Refactor freely where necessary because the project is not released.
+6. Avoid migration compatibility layers for unused legacy APIs.
+7. Implement in the specified stages.
+8. Add tests with each stage.
+9. Keep each stage independently verifiable.
 
-- FastAPI
-- Config
-- API Auth
-- Project 初始化
-- Bare Repo Cache
-- Token ASKPASS
-- Git Fetch
-- Ref 解析
+Use existing project conventions where sensible, but prefer this SPEC where the architecture conflicts.
 
-**Phase 2 — Workspace**
+Do not ask for confirmation on ordinary implementation choices.
 
-完成：
+If a documented tool behavior differs from assumptions in this SPEC, follow the tool's current official behavior, document the difference and adjust the implementation accordingly.
 
-- Commit 固定
-- 临时 Ref
-- Shallow Fetch
-- Depth 参数
-- 独立 Checkout
-- Git Object 验证
+Prioritize:
 
-**Phase 3 — Archive**
+**Correctness → Reliability → Simplicity → Performance.**
 
-完成：
-
-- tar.zst
-- FileResponse
-- 文件清理
-- Size Limit
-- Cancellation
-
-**Phase 4 — Deployment**
-
-完成：
-
-- Dockerfile
-- Docker Compose
-- Named Volume
-- Healthcheck
-- 非 Root 运行
-
-**Phase 5 — Verification**
-
-完成：
-
-- 自动化测试
-- 并发测试
-- 安全测试
-- Docker 集成测试
-- README
+The result should be a cohesive, maintainable Kagemusha service—not a collection of independent scripts.
 
 ---
 
-# 24. 给 Coding Agent 的最终要求
+# 23. Definition of Done
 
-请根据本 Spec 实现完整可运行的 Git Workspace Service。
+Kagemusha v2 is complete when:
 
-要求：
+- Repositories and Working Copies have a unified API and data model.
+- SQLite persistently manages repository and job state.
+- Cache targets support monorepos.
+- mise resolves project toolchains.
+- Gradle dependencies are shared across repositories.
+- pnpm packages are shared across compatible repositories.
+- Immutable snapshots can be restored in clean environments.
+- Incremental seeding skips unchanged targets safely.
+- Full rebuilds can recover or compact caches.
+- Failures do not corrupt published snapshots.
+- API and Worker run through Docker Compose.
+- Existing functionality is preserved or intentionally replaced.
+- No external database, message queue or cache server is required.
+- The system is independent of E2B and any specific Agent.
 
-1. 不要只生成脚手架，必须完成业务逻辑。
-2. 以 Git CLI 为核心，不引入 GitPython。
-3. 确保 Shallow Clone 正确工作，尤其是 GitHub PR 和 GitLab MR。
-4. 不允许凭证进入 Workspace 或日志。
-5. 不允许直接打包依赖控制机的 Git Worktree。
-6. 使用可迁移的独立 Git Repository。
-7. 正确处理并发 Fetch、Commit 固定和 Git Object 生命周期。
-8. Docker Compose 必须可以直接启动。
-9. 数据使用 Docker Named Volume，不使用本地 Bind Mount。
-10. 编写并执行自动化测试。
-11. 实现完成后报告测试结果和未覆盖的限制。
+**Final architectural invariant:**
 
-优先级：
-
-**Correctness > Security > Simplicity > Performance**
-
-避免过度工程化。
-
-第一版只专注于两件事：
-
-**可靠缓存 Git Repository，以及安全地生成可传入 E2B 的独立 Working Copy。**
+Kagemusha owns Git source preparation and development dependency cache preparation. The external Orchestrator owns agent execution and workspace lifecycle. Cache formats remain managed by their native tools; Kagemusha owns only their preparation, versioning, distribution and recovery.
