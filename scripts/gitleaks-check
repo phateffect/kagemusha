@@ -18,8 +18,19 @@ case "${1:-}" in
             echo "gitleaks: commit scan requires a Git ref range" >&2
             exit 2
         fi
+        if ! git rev-parse --verify --quiet "${HK_TO_REF}^{commit}" >/dev/null; then
+            echo "gitleaks: invalid destination ref: ${HK_TO_REF}" >&2
+            exit 2
+        fi
+        if git rev-parse --verify --quiet "${HK_FROM_REF}^{commit}" >/dev/null; then
+            log_options="${HK_FROM_REF}..${HK_TO_REF}"
+        else
+            # A new remote or branch has no source ref. Scan every commit reachable
+            # from the destination instead of silently accepting an invalid range.
+            log_options="${HK_TO_REF}"
+        fi
         exec gitleaks git \
-            --log-opts="${HK_FROM_REF}..${HK_TO_REF}" \
+            --log-opts="$log_options" \
             --redact \
             --verbose \
             --no-banner \
