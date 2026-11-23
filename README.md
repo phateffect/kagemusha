@@ -160,6 +160,37 @@ API 文档位于 `/docs`、`/redoc` 和 `/openapi.json`。健康检查为 `/heal
 
 ## 开发与验证
 
+### Secret 检测
+
+项目使用 mise 安装 `hk` 和 `gitleaks`。安装依赖和当前仓库的 Git hooks：
+
+```bash
+mise install
+hk install --mise
+```
+
+`pre-commit` 会扫描暂存内容，`pre-push` 会扫描即将推送的完整提交范围，避免某个提交曾加入密码、随后又删除而漏检。也可以手动扫描整个 Git 历史：
+
+```bash
+hk check --all
+```
+
+gitleaks 默认规则始终启用。需要检测公司内部 token 前缀或其他项目专属关键词时，在仓库根目录创建 `.gitleaks.local.toml`：
+
+```toml
+title = "Local secret rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "local-sensitive-keyword"
+description = "Local sensitive keyword"
+regex = '''REPLACE_WITH_A_LOCAL_REGEX'''
+```
+
+`.gitleaks.local.toml` 已被 Git 忽略，真实关键词和内部规则不会进入仓库。不要删除 `[extend] useDefault = true`，否则本地配置会取代而不是扩展 gitleaks 默认规则。
+
 ```bash
 uv sync --locked
 uv run ruff check src tests

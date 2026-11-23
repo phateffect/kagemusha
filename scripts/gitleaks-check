@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+config_argument=""
+if [ -f .gitleaks.local.toml ]; then
+    config_argument="--config=.gitleaks.local.toml"
+fi
+
+case "${1:-}" in
+    repository)
+        exec gitleaks git --redact --verbose --no-banner $config_argument .
+        ;;
+    staged)
+        exec gitleaks git --staged --redact --verbose --no-banner $config_argument .
+        ;;
+    commits)
+        if [ -z "${HK_FROM_REF:-}" ] || [ -z "${HK_TO_REF:-}" ]; then
+            echo "gitleaks: commit scan requires a Git ref range" >&2
+            exit 2
+        fi
+        exec gitleaks git \
+            --log-opts="${HK_FROM_REF}..${HK_TO_REF}" \
+            --redact \
+            --verbose \
+            --no-banner \
+            $config_argument \
+            .
+        ;;
+    *)
+        echo "usage: $0 {repository|staged|commits}" >&2
+        exit 2
+        ;;
+esac
