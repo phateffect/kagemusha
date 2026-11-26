@@ -1,0 +1,19 @@
+{
+  "name": "@shogun/runtime-poc",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test *.test.ts",
+    "poc": "node --env-file-if-exists=../../.env runtime.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.6.1",
+    "e2b": "2.31.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.9",
+    "typescript": "5.9.3"
+  }
+}
